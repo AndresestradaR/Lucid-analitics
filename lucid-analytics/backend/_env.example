@@ -1,0 +1,18 @@
+# Lucid Analytics - Backend Environment Variables
+
+# Database
+DATABASE_URL=postgresql://user:password@host:5432/lucid_analytics
+
+# Security
+SECRET_KEY=your-secret-key-min-32-chars
+ENCRYPTION_KEY=your-fernet-key-base64
+
+# Meta Ads OAuth
+META_APP_ID=your-meta-app-id
+META_APP_SECRET=your-meta-app-secret
+
+# Anthropic (para el chat IA)
+ANTHROPIC_API_KEY=sk-ant-api03-...
+
+# Server
+PORT=8000
