@@ -294,6 +294,135 @@ async def debug_sample_contacts(
     }
 
 
+# ========== DROPI DEBUG ENDPOINTS ==========
+
+@router.get("/debug/dropi-connection/{user_id}")
+async def debug_dropi_connection(
+    user_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """
+    DEBUG: Ver estado de conexión de Dropi para un usuario.
+    Muestra si hay credenciales guardadas (censuradas) y estado de sync.
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    
+    connection = db.query(DropiConnection).filter(
+        DropiConnection.user_id == user_id
+    ).first()
+    
+    if not connection:
+        return {
+            "user_id": user_id,
+            "email": user.email,
+            "has_connection": False,
+            "message": "No hay conexión de Dropi configurada"
+        }
+    
+    # Mostrar credenciales censuradas
+    has_email = bool(connection.email_encrypted)
+    has_password = bool(connection.password_encrypted)
+    
+    email_preview = None
+    if has_email:
+        try:
+            email = decrypt_token(connection.email_encrypted)
+            email_preview = email[:3] + "***" + email[email.find("@"):] if "@" in email else email[:3] + "***"
+        except:
+            email_preview = "(error al descifrar)"
+    
+    return {
+        "user_id": user_id,
+        "email": user.email,
+        "has_connection": True,
+        "is_active": connection.is_active,
+        "country": connection.country,
+        "dropi_user_id": connection.dropi_user_id,
+        "has_email_encrypted": has_email,
+        "has_password_encrypted": has_password,
+        "email_preview": email_preview,
+        "sync_status": connection.sync_status,
+        "last_orders_sync": connection.last_orders_sync.isoformat() if connection.last_orders_sync else None,
+        "last_wallet_sync": connection.last_wallet_sync.isoformat() if connection.last_wallet_sync else None,
+        "created_at": connection.created_at.isoformat() if connection.created_at else None
+    }
+
+
+@router.post("/debug/dropi-test-login/{user_id}")
+async def debug_dropi_test_login(
+    user_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """
+    DEBUG: Probar login de Dropi para un usuario.
+    Esto ayuda a diagnosticar por qué falla la sincronización.
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    
+    connection = db.query(DropiConnection).filter(
+        DropiConnection.user_id == user_id,
+        DropiConnection.is_active == True
+    ).first()
+    
+    if not connection:
+        return {
+            "success": False,
+            "error": "No hay conexión de Dropi activa",
+            "user_id": user_id,
+            "email": user.email
+        }
+    
+    if not connection.email_encrypted or not connection.password_encrypted:
+        return {
+            "success": False,
+            "error": "Faltan credenciales (email o password)",
+            "has_email": bool(connection.email_encrypted),
+            "has_password": bool(connection.password_encrypted)
+        }
+    
+    try:
+        from routers.sync_dropi import dropi_login
+        
+        email = decrypt_token(connection.email_encrypted)
+        password = decrypt_token(connection.password_encrypted)
+        
+        # Censurar para el log
+        email_censored = email[:3] + "***" + email[email.find("@"):] if "@" in email else email[:3] + "***"
+        
+        result = await dropi_login(email, password, connection.country)
+        
+        if result.get("success"):
+            return {
+                "success": True,
+                "message": "Login exitoso",
+                "user_id": user_id,
+                "dropi_email": email_censored,
+                "country": connection.country,
+                "dropi_user_id": result.get("user_id"),
+                "token_preview": result.get("token", "")[:20] + "..." if result.get("token") else None
+            }
+        else:
+            return {
+                "success": False,
+                "error": result.get("error", "Login failed"),
+                "user_id": user_id,
+                "dropi_email": email_censored,
+                "country": connection.country
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "user_id": user_id
+        }
+
+
 # ========== LUCIDBOT ENDPOINTS ==========
 
 @router.post("/lucidbot/set-token")
