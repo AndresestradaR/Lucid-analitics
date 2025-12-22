@@ -5,7 +5,7 @@ Permite al admin gestionar sincronización de LucidBot Y Dropi
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, distinct
 from typing import Optional, List
 from datetime import datetime
 from pydantic import BaseModel
@@ -186,6 +186,112 @@ async def get_all_users_status(
         ))
     
     return result
+
+
+# ========== DEBUG ENDPOINTS ==========
+
+@router.get("/debug/ad-ids/{user_id}")
+async def debug_user_ad_ids(
+    user_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """
+    DEBUG: Ver qué ad_ids existen en la BD para un usuario.
+    Esto ayuda a diagnosticar por qué los contactos no se conectan con Meta Ads.
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    
+    # Obtener ad_ids únicos con conteo
+    ad_id_counts = db.query(
+        LucidbotContact.ad_id,
+        func.count(LucidbotContact.id).label('count')
+    ).filter(
+        LucidbotContact.user_id == user_id
+    ).group_by(
+        LucidbotContact.ad_id
+    ).order_by(
+        func.count(LucidbotContact.id).desc()
+    ).limit(50).all()
+    
+    # Total de contactos
+    total = db.query(func.count(LucidbotContact.id)).filter(
+        LucidbotContact.user_id == user_id
+    ).scalar() or 0
+    
+    # Contactos con ad_id null o vacío
+    null_count = db.query(func.count(LucidbotContact.id)).filter(
+        LucidbotContact.user_id == user_id,
+        (LucidbotContact.ad_id == None) | (LucidbotContact.ad_id == "")
+    ).scalar() or 0
+    
+    # Muestra de contactos recientes
+    recent_contacts = db.query(LucidbotContact).filter(
+        LucidbotContact.user_id == user_id
+    ).order_by(LucidbotContact.contact_created_at.desc()).limit(10).all()
+    
+    return {
+        "user_id": user_id,
+        "email": user.email,
+        "total_contacts": total,
+        "contacts_without_ad_id": null_count,
+        "contacts_with_ad_id": total - null_count,
+        "unique_ad_ids": [
+            {"ad_id": ad_id or "(null/empty)", "count": count}
+            for ad_id, count in ad_id_counts
+        ],
+        "recent_contacts_sample": [
+            {
+                "id": c.lucidbot_id,
+                "name": c.full_name,
+                "ad_id": c.ad_id,
+                "created": c.contact_created_at.isoformat() if c.contact_created_at else None,
+                "total_a_pagar": c.total_a_pagar
+            }
+            for c in recent_contacts
+        ]
+    }
+
+
+@router.get("/debug/sample-contacts/{user_id}")
+async def debug_sample_contacts(
+    user_id: int,
+    limit: int = 20,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """
+    DEBUG: Ver muestra de contactos con todos sus campos.
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    
+    contacts = db.query(LucidbotContact).filter(
+        LucidbotContact.user_id == user_id
+    ).order_by(LucidbotContact.contact_created_at.desc()).limit(limit).all()
+    
+    return {
+        "user_id": user_id,
+        "email": user.email,
+        "sample_size": len(contacts),
+        "contacts": [
+            {
+                "lucidbot_id": c.lucidbot_id,
+                "full_name": c.full_name,
+                "phone": c.phone,
+                "ad_id": c.ad_id,
+                "total_a_pagar": c.total_a_pagar,
+                "producto": c.producto,
+                "calificacion": c.calificacion,
+                "contact_created_at": c.contact_created_at.isoformat() if c.contact_created_at else None,
+                "synced_at": c.synced_at.isoformat() if c.synced_at else None
+            }
+            for c in contacts
+        ]
+    }
 
 
 # ========== LUCIDBOT ENDPOINTS ==========
