@@ -127,14 +127,15 @@ async def fetch_all_contacts_for_ad(api_token: str, ad_id: str, page_id: str = N
     return all_contacts
 
 
-async def sync_contacts_to_db(db: Session, user_id: int, contacts: List[dict], ad_id: str = None) -> int:
+def sync_contacts_to_db(db: Session, user_id: int, contacts: List[dict], ad_id: str = None) -> int:
     """
     Sincronizar una lista de contactos a la base de datos.
     Usa UPSERT para evitar duplicados.
     
-    Esta función es usada por analytics.py para auto-sync.
+    NOTA: Esta función es SÍNCRONA, no async.
     """
     synced = 0
+    errors = 0
     
     for contact in contacts:
         try:
@@ -172,18 +173,17 @@ async def sync_contacts_to_db(db: Session, user_id: int, contacts: List[dict], a
             contact_data = {
                 "user_id": user_id,
                 "lucidbot_id": lucidbot_id,
-                "full_name": contact.get("name", ""),
-                "phone": contact.get("phone", ""),
+                "full_name": contact.get("name", "") or contact.get("n", "") or "",
+                "phone": contact.get("phone", "") or contact.get("ph", "") or "",
                 "ad_id": contact.get("ad_id") or ad_id,
                 "total_a_pagar": total_a_pagar,
                 "producto": producto,
                 "calificacion": contact.get("qualification"),
                 "contact_created_at": contact_created,
                 "synced_at": datetime.utcnow(),
-                "raw_data": json.dumps(contact)
             }
             
-            # UPSERT
+            # UPSERT usando SQL directo para mejor manejo de errores
             stmt = pg_insert(LucidbotContact).values(**contact_data)
             stmt = stmt.on_conflict_do_update(
                 index_elements=['lucidbot_id'],
@@ -195,18 +195,32 @@ async def sync_contacts_to_db(db: Session, user_id: int, contacts: List[dict], a
                     "producto": stmt.excluded.producto,
                     "calificacion": stmt.excluded.calificacion,
                     "synced_at": stmt.excluded.synced_at,
-                    "raw_data": stmt.excluded.raw_data,
                     "updated_at": datetime.utcnow()
                 }
             )
             db.execute(stmt)
             synced += 1
             
+            # Commit cada 100 contactos para evitar transacciones muy largas
+            if synced % 100 == 0:
+                db.commit()
+            
         except Exception as e:
-            print(f"[SYNC TO DB] Error processing contact: {e}")
+            errors += 1
+            # Rollback la transacción actual para poder continuar
+            db.rollback()
+            if errors <= 3:  # Solo mostrar primeros 3 errores
+                print(f"[SYNC TO DB] Error processing contact: {e}")
             continue
     
-    db.commit()
+    # Commit final
+    try:
+        db.commit()
+    except Exception as e:
+        print(f"[SYNC TO DB] Error in final commit: {e}")
+        db.rollback()
+    
+    print(f"[SYNC TO DB] Completed: {synced} synced, {errors} errors")
     return synced
 
 
@@ -244,13 +258,19 @@ async def sync_contacts_for_user(
             
             print(f"[LUCIDBOT SYNC] Processing page {page} with {len(contacts)} contacts")
             
-            synced = await sync_contacts_to_db(db, user_id, contacts)
+            # sync_contacts_to_db es síncrono
+            synced = sync_contacts_to_db(db, user_id, contacts)
             total_synced += synced
             
             if len(contacts) < page_size:
                 break
             
             page += 1
+            
+            # Límite de seguridad: máximo 200 páginas (100,000 contactos)
+            if page >= 200:
+                print(f"[LUCIDBOT SYNC] Reached page limit, stopping")
+                break
         
         print(f"[LUCIDBOT SYNC] Completed: {total_synced} contacts synced")
         return {"success": True, "synced": total_synced}
@@ -295,12 +315,19 @@ async def sync_all_lucidbot_users() -> list:
                 try:
                     jwt_token = decrypt_token(conn.jwt_token_encrypted)
                     print(f"[LUCIDBOT CRON] Syncing user {user.email}...")
-                    result = await sync_contacts_for_user(
-                        conn.user_id, 
-                        jwt_token, 
-                        conn.page_id,
-                        db
-                    )
+                    
+                    # Crear nueva sesión para cada usuario
+                    user_db = SessionLocal()
+                    try:
+                        result = await sync_contacts_for_user(
+                            conn.user_id, 
+                            jwt_token, 
+                            conn.page_id,
+                            user_db
+                        )
+                    finally:
+                        user_db.close()
+                    
                     results.append({
                         "user_id": conn.user_id,
                         "email": user.email,
