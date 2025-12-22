@@ -246,6 +246,17 @@ def run_migrations():
             END IF;
         END $$;
         """,
+        
+        # ==================== MIGRACIÓN 17: LIMPIAR raw_data PARA AHORRAR ESPACIO ====================
+        # Esta migración limpia los datos raw_data existentes que consumen ~80% del espacio
+        """
+        UPDATE dropi_orders SET raw_data = NULL WHERE raw_data IS NOT NULL;
+        """,
+        """
+        UPDATE dropi_wallet_history SET raw_data = NULL WHERE raw_data IS NOT NULL;
+        """,
+        # VACUUM para recuperar espacio en disco (solo en PostgreSQL)
+        # Nota: VACUUM no puede ejecutarse dentro de una transacción, así que lo hacemos por separado
     ]
     
     with engine.connect() as conn:
@@ -256,6 +267,15 @@ def run_migrations():
                 print(f"✅ Migración {i+1}/{len(migrations)} ejecutada")
             except Exception as e:
                 print(f"⚠️ Migración {i+1} ya aplicada o error: {e}")
+        
+        # Ejecutar VACUUM por separado (requiere autocommit)
+        try:
+            conn.execution_options(isolation_level="AUTOCOMMIT")
+            conn.execute(text("VACUUM ANALYZE dropi_orders;"))
+            conn.execute(text("VACUUM ANALYZE dropi_wallet_history;"))
+            print("✅ VACUUM ejecutado - espacio recuperado")
+        except Exception as e:
+            print(f"⚠️ VACUUM no ejecutado (normal en algunas configuraciones): {e}")
 
 
 async def scheduled_sync():
@@ -326,14 +346,14 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     print("✅ Scheduler iniciado - Sync cada 2 horas")
     
-    # Ejecutar sync inicial después de 30 segundos (dar tiempo a que arranque todo)
+    # Ejecutar sync inicial después de 60 segundos (dar tiempo a migraciones y VACUUM)
     async def delayed_initial_sync():
-        await asyncio.sleep(30)
+        await asyncio.sleep(60)
         print("\n🚀 [STARTUP] Ejecutando sync inicial...")
         await scheduled_sync()
     
     asyncio.create_task(delayed_initial_sync())
-    print("✅ Sync inicial programado para 30 segundos")
+    print("✅ Sync inicial programado para 60 segundos")
     
     yield
     
@@ -345,7 +365,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Lucid Analytics API",
     description="Dashboard de métricas Meta Ads + LucidBot + Dropi para calcular CPA real",
-    version="2.5.0",
+    version="2.6.0",
     lifespan=lifespan
 )
 
@@ -373,7 +393,7 @@ async def root():
     return {
         "status": "ok",
         "service": "Lucid Analytics API",
-        "version": "2.5.0",
+        "version": "2.6.0",
         "features": ["Meta Ads", "LucidBot", "Dropi", "Chat IA", "Sync", "Admin", "Scheduler"],
         "scheduler": "running" if scheduler.running else "stopped",
         "docs": "/docs"
