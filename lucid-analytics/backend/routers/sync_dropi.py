@@ -10,6 +10,7 @@ Flujo:
 
 import httpx
 import json
+import asyncio
 from datetime import datetime, timedelta
 from typing import Optional
 from sqlalchemy.orm import Session
@@ -63,14 +64,26 @@ STATUS_NORMALIZE = {
 
 
 def get_dropi_headers(token: str = None, country: str = "co"):
-    """Headers para requests a Dropi"""
+    """
+    Headers COMPLETOS para requests a Dropi - CRÍTICO para evitar "Access denied"
+    Estos headers imitan exactamente a un navegador Chrome real.
+    """
     origin = f"https://app.dropi.{country}"
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/plain, */*",
         "Origin": origin,
         "Referer": f"{origin}/",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site"
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -78,7 +91,7 @@ def get_dropi_headers(token: str = None, country: str = "co"):
 
 
 async def dropi_login(email: str, password: str, country: str) -> dict:
-    """Hacer login en Dropi y obtener token"""
+    """Hacer login en Dropi y obtener token con timeout real"""
     api_url = DROPI_API_URLS.get(country, DROPI_API_URLS["co"])
     white_brand_id = WHITE_BRAND_IDS.get(country, WHITE_BRAND_IDS["co"])
     
@@ -91,25 +104,28 @@ async def dropi_login(email: str, password: str, country: str) -> dict:
         "with_cdc": False
     }
     
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            response = await client.post(
-                f"{api_url}/api/login",
-                json=payload,
-                headers=get_dropi_headers(country=country)
-            )
-            data = response.json()
-            
-            if data.get("isSuccess") and data.get("token"):
-                user_data = data.get("objects", {})
-                return {
-                    "success": True,
-                    "token": data["token"],
-                    "user_id": str(user_data.get("id", "")),
-                }
-            return {"success": False, "error": data.get("message", "Login failed")}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+    try:
+        async with asyncio.timeout(20):  # Timeout real de 20 segundos
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
+                response = await client.post(
+                    f"{api_url}/api/login",
+                    json=payload,
+                    headers=get_dropi_headers(country=country)
+                )
+                data = response.json()
+                
+                if data.get("isSuccess") and data.get("token"):
+                    user_data = data.get("objects", {})
+                    return {
+                        "success": True,
+                        "token": data["token"],
+                        "user_id": str(user_data.get("id", "")),
+                    }
+                return {"success": False, "error": data.get("message", "Login failed")}
+    except asyncio.TimeoutError:
+        return {"success": False, "error": "Dropi no responde (timeout)"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 async def fetch_dropi_orders(token: str, country: str, page: int = 0, limit: int = 100) -> dict:
@@ -126,29 +142,32 @@ async def fetch_dropi_orders(token: str, country: str, page: int = 0, limit: int
         "order_dir": "desc"
     }
     
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        try:
-            response = await client.get(
-                f"{api_url}/api/orders/myorders",
-                headers=get_dropi_headers(token, country),
-                params=params
-            )
-            
-            if response.status_code == 401:
-                return {"success": False, "error": "Token expirado", "expired": True}
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("isSuccess"):
-                    return {
-                        "success": True,
-                        "orders": data.get("data", {}).get("objects", []),
-                        "total": data.get("data", {}).get("total", 0)
-                    }
-            
-            return {"success": False, "error": f"HTTP {response.status_code}"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+    try:
+        async with asyncio.timeout(60):  # Timeout de 60s para órdenes
+            async with httpx.AsyncClient(timeout=httpx.Timeout(55.0, connect=10.0)) as client:
+                response = await client.get(
+                    f"{api_url}/api/orders/myorders",
+                    headers=get_dropi_headers(token, country),
+                    params=params
+                )
+                
+                if response.status_code == 401:
+                    return {"success": False, "error": "Token expirado", "expired": True}
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get("isSuccess"):
+                        return {
+                            "success": True,
+                            "orders": data.get("objects", []),
+                            "total": data.get("total", 0)
+                        }
+                
+                return {"success": False, "error": f"HTTP {response.status_code}"}
+    except asyncio.TimeoutError:
+        return {"success": False, "error": "Timeout fetching orders"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 async def fetch_dropi_wallet(token: str, country: str, user_id: str, page: int = 0, limit: int = 500, from_date: str = None) -> dict:
@@ -176,29 +195,32 @@ async def fetch_dropi_wallet(token: str, country: str, user_id: str, page: int =
         "wallet_id": 0
     }
     
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        try:
-            response = await client.get(
-                f"{api_url}/api/historywallet",
-                headers=get_dropi_headers(token, country),
-                params=params
-            )
-            
-            if response.status_code == 401:
-                return {"success": False, "error": "Token expirado", "expired": True}
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("isSuccess"):
-                    return {
-                        "success": True,
-                        "movements": data.get("data", {}).get("objects", []),
-                        "total": data.get("data", {}).get("total", 0)
-                    }
-            
-            return {"success": False, "error": f"HTTP {response.status_code}"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+    try:
+        async with asyncio.timeout(60):
+            async with httpx.AsyncClient(timeout=httpx.Timeout(55.0, connect=10.0)) as client:
+                response = await client.get(
+                    f"{api_url}/api/historywallet",
+                    headers=get_dropi_headers(token, country),
+                    params=params
+                )
+                
+                if response.status_code == 401:
+                    return {"success": False, "error": "Token expirado", "expired": True}
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get("isSuccess"):
+                        return {
+                            "success": True,
+                            "movements": data.get("objects", []),
+                            "total": data.get("total", 0)
+                        }
+                
+                return {"success": False, "error": f"HTTP {response.status_code}"}
+    except asyncio.TimeoutError:
+        return {"success": False, "error": "Timeout fetching wallet"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 def normalize_status(status_raw: str) -> str:
@@ -295,8 +317,11 @@ async def sync_dropi_orders_for_user(
                 if not order_created:
                     continue
                 
-                # Normalizar status
-                status_raw = str(order.get("status", "")).strip()
+                # Normalizar status - puede venir como string o como objeto
+                status_raw = order.get("status", "")
+                if isinstance(status_raw, dict):
+                    status_raw = status_raw.get("name", status_raw.get("id", ""))
+                status_raw = str(status_raw).strip()
                 status_normalized = normalize_status(status_raw)
                 
                 # Extraer productos
@@ -623,6 +648,7 @@ async def sync_dropi_full(user_id: int, db: Session = None) -> dict:
         email = decrypt_token(connection.email_encrypted)
         password = decrypt_token(connection.password_encrypted)
         
+        print(f"[DROPI SYNC] Logging in for user {user_id}...")
         login_result = await dropi_login(email, password, connection.country)
         if not login_result.get("success"):
             connection.sync_status = "error"
@@ -631,6 +657,8 @@ async def sync_dropi_full(user_id: int, db: Session = None) -> dict:
         
         token = login_result["token"]
         dropi_user_id = login_result.get("user_id") or connection.dropi_user_id
+        
+        print(f"[DROPI SYNC] Login successful, dropi_user_id={dropi_user_id}")
         
         # Actualizar token
         connection.current_token = token
