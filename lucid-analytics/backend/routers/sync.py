@@ -5,7 +5,7 @@ Traemos TODOS los contactos por página y los guardamos localmente.
 
 import httpx
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, List
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy import text
@@ -21,20 +21,27 @@ async def fetch_lucidbot_contacts_page(
     jwt_token: str,
     page_id: str,
     page: int = 0,
-    page_size: int = 500
+    page_size: int = 500,
+    ad_id: str = None
 ) -> dict:
     """
     Obtener una página de contactos de LucidBot.
+    Opcionalmente filtrar por ad_id.
     """
     headers = {
         "Content-Type": "application/json",
         "Cookie": f"token={jwt_token}; last_page_id={page_id}"
     }
     
+    # Construir condiciones de filtro
+    cdts = []
+    if ad_id:
+        cdts = [{"col": "ad_id", "op": "=", "val": ad_id}]
+    
     payload = {
         "op": "users",
         "op1": "get",
-        "cdts": [],
+        "cdts": cdts,
         "oprt": 1,
         "search_text": "",
         "datatable": {
@@ -72,6 +79,137 @@ async def fetch_lucidbot_contacts_page(
             return {"success": False, "error": str(e)}
 
 
+async def fetch_all_contacts_for_ad(api_token: str, ad_id: str, page_id: str = None) -> List[dict]:
+    """
+    Obtener TODOS los contactos para un ad_id específico.
+    Pagina automáticamente hasta obtener todos.
+    
+    Esta función es usada por analytics.py para auto-sync.
+    """
+    all_contacts = []
+    page = 0
+    page_size = 500
+    
+    # Si no hay page_id, intentar obtenerlo del token (no es posible, retornar vacío)
+    if not page_id:
+        print(f"[FETCH AD] No page_id provided for ad_id={ad_id}")
+        return []
+    
+    while True:
+        result = await fetch_lucidbot_contacts_page(
+            jwt_token=api_token,
+            page_id=page_id,
+            page=page,
+            page_size=page_size,
+            ad_id=ad_id
+        )
+        
+        if not result.get("success"):
+            print(f"[FETCH AD] Error fetching page {page}: {result.get('error')}")
+            break
+        
+        contacts = result.get("contacts", [])
+        if not contacts:
+            break
+        
+        all_contacts.extend(contacts)
+        print(f"[FETCH AD] ad_id={ad_id} page {page}: {len(contacts)} contacts")
+        
+        if len(contacts) < page_size:
+            break
+        
+        page += 1
+        
+        # Límite de seguridad
+        if page > 100:
+            break
+    
+    return all_contacts
+
+
+async def sync_contacts_to_db(db: Session, user_id: int, contacts: List[dict], ad_id: str = None) -> int:
+    """
+    Sincronizar una lista de contactos a la base de datos.
+    Usa UPSERT para evitar duplicados.
+    
+    Esta función es usada por analytics.py para auto-sync.
+    """
+    synced = 0
+    
+    for contact in contacts:
+        try:
+            lucidbot_id = contact.get("id")
+            if not lucidbot_id:
+                continue
+            
+            # Parsear fecha
+            created_str = contact.get("dt", "")
+            contact_created = None
+            if created_str:
+                try:
+                    contact_created = datetime.strptime(created_str, "%Y-%m-%d %H:%M:%S")
+                except:
+                    contact_created = datetime.now()
+            else:
+                contact_created = datetime.now()
+            
+            # Extraer total_a_pagar y producto
+            total_a_pagar = None
+            producto = None
+            
+            campos = contact.get("cf", {})
+            if isinstance(campos, dict):
+                for key, value in campos.items():
+                    key_lower = key.lower()
+                    if "total" in key_lower and "pagar" in key_lower:
+                        try:
+                            total_a_pagar = float(str(value).replace(",", "").replace("$", ""))
+                        except:
+                            pass
+                    if "producto" in key_lower or "product" in key_lower:
+                        producto = str(value)[:500] if value else None
+            
+            contact_data = {
+                "user_id": user_id,
+                "lucidbot_id": lucidbot_id,
+                "full_name": contact.get("name", ""),
+                "phone": contact.get("phone", ""),
+                "ad_id": contact.get("ad_id") or ad_id,
+                "total_a_pagar": total_a_pagar,
+                "producto": producto,
+                "calificacion": contact.get("qualification"),
+                "contact_created_at": contact_created,
+                "synced_at": datetime.utcnow(),
+                "raw_data": json.dumps(contact)
+            }
+            
+            # UPSERT
+            stmt = pg_insert(LucidbotContact).values(**contact_data)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=['lucidbot_id'],
+                set_={
+                    "full_name": stmt.excluded.full_name,
+                    "phone": stmt.excluded.phone,
+                    "ad_id": stmt.excluded.ad_id,
+                    "total_a_pagar": stmt.excluded.total_a_pagar,
+                    "producto": stmt.excluded.producto,
+                    "calificacion": stmt.excluded.calificacion,
+                    "synced_at": stmt.excluded.synced_at,
+                    "raw_data": stmt.excluded.raw_data,
+                    "updated_at": datetime.utcnow()
+                }
+            )
+            db.execute(stmt)
+            synced += 1
+            
+        except Exception as e:
+            print(f"[SYNC TO DB] Error processing contact: {e}")
+            continue
+    
+    db.commit()
+    return synced
+
+
 async def sync_contacts_for_user(
     user_id: int,
     jwt_token: str,
@@ -106,77 +244,8 @@ async def sync_contacts_for_user(
             
             print(f"[LUCIDBOT SYNC] Processing page {page} with {len(contacts)} contacts")
             
-            for contact in contacts:
-                try:
-                    lucidbot_id = contact.get("id")
-                    if not lucidbot_id:
-                        continue
-                    
-                    # Parsear fecha
-                    created_str = contact.get("dt", "")
-                    contact_created = None
-                    if created_str:
-                        try:
-                            contact_created = datetime.strptime(created_str, "%Y-%m-%d %H:%M:%S")
-                        except:
-                            contact_created = datetime.now()
-                    else:
-                        contact_created = datetime.now()
-                    
-                    # Extraer total_a_pagar y producto
-                    total_a_pagar = None
-                    producto = None
-                    
-                    campos = contact.get("cf", {})
-                    if isinstance(campos, dict):
-                        for key, value in campos.items():
-                            key_lower = key.lower()
-                            if "total" in key_lower and "pagar" in key_lower:
-                                try:
-                                    total_a_pagar = float(str(value).replace(",", "").replace("$", ""))
-                                except:
-                                    pass
-                            if "producto" in key_lower or "product" in key_lower:
-                                producto = str(value)[:500] if value else None
-                    
-                    contact_data = {
-                        "user_id": user_id,
-                        "lucidbot_id": lucidbot_id,
-                        "full_name": contact.get("name", ""),
-                        "phone": contact.get("phone", ""),
-                        "ad_id": contact.get("ad_id"),
-                        "total_a_pagar": total_a_pagar,
-                        "producto": producto,
-                        "calificacion": contact.get("qualification"),
-                        "contact_created_at": contact_created,
-                        "synced_at": datetime.utcnow(),
-                        "raw_data": json.dumps(contact)
-                    }
-                    
-                    # UPSERT
-                    stmt = pg_insert(LucidbotContact).values(**contact_data)
-                    stmt = stmt.on_conflict_do_update(
-                        index_elements=['lucidbot_id'],
-                        set_={
-                            "full_name": stmt.excluded.full_name,
-                            "phone": stmt.excluded.phone,
-                            "ad_id": stmt.excluded.ad_id,
-                            "total_a_pagar": stmt.excluded.total_a_pagar,
-                            "producto": stmt.excluded.producto,
-                            "calificacion": stmt.excluded.calificacion,
-                            "synced_at": stmt.excluded.synced_at,
-                            "raw_data": stmt.excluded.raw_data,
-                            "updated_at": datetime.utcnow()
-                        }
-                    )
-                    db.execute(stmt)
-                    total_synced += 1
-                    
-                except Exception as e:
-                    print(f"[LUCIDBOT SYNC] Error processing contact: {e}")
-                    continue
-            
-            db.commit()
+            synced = await sync_contacts_to_db(db, user_id, contacts)
+            total_synced += synced
             
             if len(contacts) < page_size:
                 break
