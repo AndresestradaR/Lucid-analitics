@@ -4,6 +4,9 @@ Combina datos de Meta + LucidBot (desde BD local) para calcular CPA, ROAS, etc.
 
 CAMBIO PRINCIPAL: Ahora consulta la base de datos local en lugar de la API de LucidBot.
 Esto resuelve el límite de 100 contactos y mejora la velocidad.
+
+FIX: Ahora SIEMPRE consulta la BD local aunque no haya token de LucidBot activo.
+El token solo se usa para auto-sincronizar datos faltantes.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -155,12 +158,8 @@ def get_lucidbot_data_from_db(
     """
     Obtener datos de contactos desde la BASE DE DATOS LOCAL.
     
-    IMPORTANTE: Las fechas en la BD están en UTC.
-    El usuario consulta en hora Colombia (UTC-5).
-    
-    Convertimos:
-    - start_date Colombia 00:00 → UTC 05:00 del mismo día
-    - end_date Colombia 23:59 → UTC 04:59 del día siguiente
+    IMPORTANTE: Las fechas en la BD están en hora Colombia (tal cual vienen de LucidBot).
+    NO se necesita conversión de timezone.
     
     Args:
         db: Sesión de base de datos
@@ -173,12 +172,10 @@ def get_lucidbot_data_from_db(
         Dict con leads, sales, revenue y detalles
     """
     try:
-        # Las fechas en la BD están en hora Colombia (tal cual vienen de LucidBot)
-        # NO se necesita conversión de timezone
         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
         end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
         
-        logger.info(f"[DB QUERY] ad_id={ad_id}, range: {start_dt} → {end_dt}")
+        logger.info(f"[DB QUERY] user_id={user_id}, ad_id={ad_id}, range: {start_dt} → {end_dt}")
         
         # Consultar contactos en rango
         contacts = db.query(LucidbotContact).filter(
@@ -225,8 +222,8 @@ def get_lucidbot_data_from_db(
             "_debug": {
                 "source": "local_db",
                 "total_contacts": len(contacts),
-                "utc_start": start_dt.isoformat(),
-                "utc_end": end_dt.isoformat()
+                "start": start_dt.isoformat(),
+                "end": end_dt.isoformat()
             }
         }
     
@@ -300,7 +297,8 @@ async def get_dashboard(
     Dashboard principal: métricas combinadas Meta + LucidBot
     
     CAMBIO: Ahora usa la base de datos local para LucidBot.
-    Si sync=True (default), sincroniza automáticamente ads sin datos.
+    SIEMPRE consulta la BD local, aunque no haya token activo.
+    El token solo se usa para auto-sincronizar datos faltantes.
     """
     
     meta_account = db.query(MetaAccount).filter(
@@ -315,6 +313,7 @@ async def get_dashboard(
             detail="Cuenta de Meta no encontrada"
         )
     
+    # Verificar si hay conexión de LucidBot con token (para auto-sync)
     lucidbot_conn = db.query(LucidbotConnection).filter(
         LucidbotConnection.user_id == current_user.id,
         LucidbotConnection.is_active == True
@@ -322,7 +321,7 @@ async def get_dashboard(
     
     meta_token = decrypt_token(meta_account.access_token_encrypted)
     
-    # Obtener JWT token y page_id de LucidBot
+    # Obtener JWT token y page_id de LucidBot (solo para auto-sync)
     jwt_token = None
     page_id = None
     if lucidbot_conn and lucidbot_conn.jwt_token_encrypted:
@@ -358,35 +357,31 @@ async def get_dashboard(
         ad_id = ad.get("ad_id")
         spend = float(ad.get("spend", 0))
         
-        # Obtener datos de LucidBot desde BD LOCAL
-        if jwt_token and page_id:
-            # Verificar si hay datos en BD para este ad_id
-            contact_count = db.query(func.count(LucidbotContact.id)).filter(
-                LucidbotContact.user_id == current_user.id,
-                LucidbotContact.ad_id == ad_id
-            ).scalar()
-            
-            # Si no hay datos y sync=True, sincronizar
-            if contact_count == 0 and sync:
-                try:
-                    synced = await sync_ad_if_needed(
-                        db, current_user.id, jwt_token, page_id, ad_id, force=True
-                    )
-                    if synced:
-                        synced_ads.append(ad_id)
-                except Exception as e:
-                    logger.error(f"Error sincronizando ad_id={ad_id}: {str(e)}")
-            
-            # Consultar BD local
-            lucid_data = get_lucidbot_data_from_db(
-                db, 
-                current_user.id,
-                ad_id,
-                start_date,
-                end_date
-            )
-        else:
-            lucid_data = {"leads": 0, "sales": 0, "revenue": 0}
+        # Verificar si hay datos en BD para este ad_id
+        contact_count = db.query(func.count(LucidbotContact.id)).filter(
+            LucidbotContact.user_id == current_user.id,
+            LucidbotContact.ad_id == ad_id
+        ).scalar()
+        
+        # Si no hay datos en BD y hay token activo y sync=True, intentar sincronizar
+        if contact_count == 0 and jwt_token and page_id and sync:
+            try:
+                synced = await sync_ad_if_needed(
+                    db, current_user.id, jwt_token, page_id, ad_id, force=True
+                )
+                if synced:
+                    synced_ads.append(ad_id)
+            except Exception as e:
+                logger.error(f"Error sincronizando ad_id={ad_id}: {str(e)}")
+        
+        # SIEMPRE consultar BD local (aunque no haya token activo)
+        lucid_data = get_lucidbot_data_from_db(
+            db, 
+            current_user.id,
+            ad_id,
+            start_date,
+            end_date
+        )
         
         leads = lucid_data["leads"]
         sales = lucid_data["sales"]
@@ -459,7 +454,8 @@ async def get_dashboard(
         },
         "_sync_info": {
             "synced_ads": synced_ads,
-            "source": "local_db"
+            "source": "local_db",
+            "has_active_token": bool(jwt_token)
         }
     }
 
