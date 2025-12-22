@@ -89,17 +89,155 @@ def run_migrations():
                 ALTER TABLE lucidbot_contacts ALTER COLUMN lucidbot_id TYPE BIGINT;
             END IF;
         END $$;
+        """,
+        
+        # ==================== MIGRACIONES DROPI CACHE ====================
+        
+        # Agregar columnas a dropi_connections
         """
+        DO $$ 
+        BEGIN 
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                           WHERE table_name='dropi_connections' AND column_name='last_orders_sync') THEN
+                ALTER TABLE dropi_connections ADD COLUMN last_orders_sync TIMESTAMP;
+            END IF;
+        END $$;
+        """,
+        """
+        DO $$ 
+        BEGIN 
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                           WHERE table_name='dropi_connections' AND column_name='last_wallet_sync') THEN
+                ALTER TABLE dropi_connections ADD COLUMN last_wallet_sync TIMESTAMP;
+            END IF;
+        END $$;
+        """,
+        """
+        DO $$ 
+        BEGIN 
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                           WHERE table_name='dropi_connections' AND column_name='sync_status') THEN
+                ALTER TABLE dropi_connections ADD COLUMN sync_status VARCHAR(50) DEFAULT 'pending';
+            END IF;
+        END $$;
+        """,
+        
+        # Crear tabla dropi_orders
+        """
+        CREATE TABLE IF NOT EXISTS dropi_orders (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            dropi_order_id BIGINT NOT NULL,
+            status VARCHAR(100),
+            status_raw VARCHAR(100),
+            total_order NUMERIC(12, 2) DEFAULT 0,
+            shipping_amount NUMERIC(12, 2) DEFAULT 0,
+            dropshipper_profit NUMERIC(12, 2) DEFAULT 0,
+            customer_name VARCHAR(255),
+            customer_phone VARCHAR(50),
+            customer_city VARCHAR(100),
+            customer_state VARCHAR(100),
+            customer_address TEXT,
+            shipping_guide VARCHAR(100),
+            shipping_company VARCHAR(100),
+            rate_type VARCHAR(50),
+            products_json TEXT,
+            order_created_at TIMESTAMP NOT NULL,
+            order_updated_at TIMESTAMP,
+            delivered_at TIMESTAMP,
+            returned_at TIMESTAMP,
+            is_paid BOOLEAN DEFAULT FALSE,
+            paid_at TIMESTAMP,
+            paid_amount NUMERIC(12, 2),
+            wallet_transaction_id BIGINT,
+            is_return_charged BOOLEAN DEFAULT FALSE,
+            return_charged_at TIMESTAMP,
+            return_charged_amount NUMERIC(12, 2),
+            synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            raw_data TEXT
+        );
+        """,
+        
+        # Índices para dropi_orders
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_dropi_orders_user_dropi_id') THEN
+                CREATE UNIQUE INDEX idx_dropi_orders_user_dropi_id ON dropi_orders(user_id, dropi_order_id);
+            END IF;
+        END $$;
+        """,
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_dropi_orders_user_created') THEN
+                CREATE INDEX idx_dropi_orders_user_created ON dropi_orders(user_id, order_created_at);
+            END IF;
+        END $$;
+        """,
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_dropi_orders_user_status') THEN
+                CREATE INDEX idx_dropi_orders_user_status ON dropi_orders(user_id, status);
+            END IF;
+        END $$;
+        """,
+        
+        # Crear tabla dropi_wallet_history
+        """
+        CREATE TABLE IF NOT EXISTS dropi_wallet_history (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            dropi_wallet_id BIGINT NOT NULL,
+            movement_type VARCHAR(50),
+            description TEXT,
+            amount NUMERIC(12, 2) DEFAULT 0,
+            balance_after NUMERIC(12, 2) DEFAULT 0,
+            order_id BIGINT,
+            category VARCHAR(50),
+            movement_created_at TIMESTAMP NOT NULL,
+            synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            raw_data TEXT
+        );
+        """,
+        
+        # Índices para dropi_wallet_history
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_dropi_wallet_user_dropi_id') THEN
+                CREATE UNIQUE INDEX idx_dropi_wallet_user_dropi_id ON dropi_wallet_history(user_id, dropi_wallet_id);
+            END IF;
+        END $$;
+        """,
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_dropi_wallet_user_created') THEN
+                CREATE INDEX idx_dropi_wallet_user_created ON dropi_wallet_history(user_id, movement_created_at);
+            END IF;
+        END $$;
+        """,
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_dropi_wallet_order') THEN
+                CREATE INDEX idx_dropi_wallet_order ON dropi_wallet_history(user_id, order_id);
+            END IF;
+        END $$;
+        """,
     ]
     
     with engine.connect() as conn:
-        for migration in migrations:
+        for i, migration in enumerate(migrations):
             try:
                 conn.execute(text(migration))
                 conn.commit()
-                print("✅ Migración ejecutada")
+                print(f"✅ Migración {i+1}/{len(migrations)} ejecutada")
             except Exception as e:
-                print(f"⚠️ Migración ya aplicada o error: {e}")
+                print(f"⚠️ Migración {i+1} ya aplicada o error: {e}")
 
 
 async def scheduled_sync():
@@ -170,7 +308,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Lucid Analytics API",
     description="Dashboard de métricas Meta Ads + LucidBot + Dropi para calcular CPA real",
-    version="2.3.0",
+    version="2.3.1",
     lifespan=lifespan
 )
 
@@ -198,7 +336,7 @@ async def root():
     return {
         "status": "ok",
         "service": "Lucid Analytics API",
-        "version": "2.3.0",
+        "version": "2.3.1",
         "features": ["Meta Ads", "LucidBot", "Dropi", "Chat IA", "Sync", "Admin", "Scheduler"],
         "scheduler": "running" if scheduler.running else "stopped",
         "docs": "/docs"
