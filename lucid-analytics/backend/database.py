@@ -7,6 +7,7 @@ CON CACHE LOCAL PARA DROPI
 from sqlalchemy import create_engine, Column, Integer, BigInteger, String, DateTime, Float, Boolean, ForeignKey, Text, Numeric, Index
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.pool import QueuePool
 from datetime import datetime
 import os
 
@@ -16,7 +17,22 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./lucid_analytics.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-engine = create_engine(DATABASE_URL)
+# Configuración del pool de conexiones OPTIMIZADA
+# - pool_size: conexiones permanentes
+# - max_overflow: conexiones adicionales temporales
+# - pool_timeout: segundos para esperar una conexión libre
+# - pool_recycle: reciclar conexiones después de N segundos (evita conexiones stale)
+# - pool_pre_ping: verificar que la conexión esté viva antes de usarla
+engine = create_engine(
+    DATABASE_URL,
+    poolclass=QueuePool,
+    pool_size=10,          # Aumentado de 5 a 10
+    max_overflow=20,       # Aumentado de 10 a 20
+    pool_timeout=10,       # Reducido de 30 a 10 (falla rápido)
+    pool_recycle=300,      # Reciclar conexiones cada 5 minutos
+    pool_pre_ping=True,    # Verificar conexiones antes de usar
+)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
