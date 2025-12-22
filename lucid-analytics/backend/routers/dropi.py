@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from pydantic import BaseModel
 import httpx
 import time
+import asyncio
 
 from database import get_db, User, DropiConnection
 from routers.auth import get_current_user
@@ -90,7 +91,7 @@ def get_dropi_headers(token: str = None, country: str = "co"):
 async def dropi_login(email: str, password: str, country: str) -> dict:
     """
     Hace login en Dropi y obtiene el token
-    IDÉNTICO al MCP server que funciona
+    Con timeout REAL usando asyncio.timeout()
     """
     start_time = time.time()
     api_url = DROPI_API_URLS.get(country, DROPI_API_URLS["co"])
@@ -108,134 +109,130 @@ async def dropi_login(email: str, password: str, country: str) -> dict:
         "with_cdc": False
     }
     
-    print(f"[DROPI LOGIN] START - {email} at {datetime.now().isoformat()}")
-    print(f"[DROPI LOGIN] URL: {url}, Country: {country}")
+    print(f"[DROPI LOGIN] START - {email}")
     
-    async with httpx.AsyncClient(timeout=15.0) as client:  # Reducido a 15s
-        try:
-            print(f"[DROPI LOGIN] Sending request... ({time.time() - start_time:.2f}s)")
-            response = await client.post(
-                url, 
-                json=payload, 
-                headers=get_dropi_headers(country=country)
-            )
-            
-            elapsed = time.time() - start_time
-            print(f"[DROPI LOGIN] Response in {elapsed:.2f}s - Status: {response.status_code}")
-            print(f"[DROPI LOGIN] Response: {response.text[:300]}")
-            
-            # Intentar parsear respuesta
-            try:
-                data = response.json()
-            except:
-                return {"success": False, "error": f"Respuesta inválida de Dropi: {response.text[:200]}"}
-            
-            # Verificar respuesta exitosa
-            if data.get("isSuccess") and data.get("token"):
-                user_data = data.get("objects", {})
+    try:
+        # asyncio.timeout() es el ÚNICO que garantiza cortar en el tiempo especificado
+        async with asyncio.timeout(15):  # 15 segundos MÁXIMO
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+                response = await client.post(
+                    url, 
+                    json=payload, 
+                    headers=get_dropi_headers(country=country)
+                )
                 
-                # Extraer wallet del usuario - múltiples formatos posibles
-                wallet_balance = 0
+                elapsed = time.time() - start_time
+                print(f"[DROPI LOGIN] Response in {elapsed:.2f}s - Status: {response.status_code}")
                 
-                # Formato 1: wallet como objeto con amount
-                wallet_obj = user_data.get("wallet")
-                if isinstance(wallet_obj, dict):
-                    wallet_balance = float(wallet_obj.get("amount", 0) or 0)
-                elif wallet_obj is not None:
-                    try:
-                        wallet_balance = float(wallet_obj)
-                    except:
-                        pass
+                # Intentar parsear respuesta
+                try:
+                    data = response.json()
+                except:
+                    return {"success": False, "error": f"Respuesta inválida de Dropi"}
                 
-                # Formato 2: wallets como array
-                if wallet_balance == 0:
-                    wallets = user_data.get("wallets", [])
-                    if wallets and isinstance(wallets, list):
-                        for w in wallets:
-                            if isinstance(w, dict) and w.get("amount"):
-                                wallet_balance = float(w.get("amount", 0))
-                                break
-                
-                # Formato 3: balance directo en user
-                if wallet_balance == 0:
-                    balance = user_data.get("balance")
-                    if balance:
+                # Verificar respuesta exitosa
+                if data.get("isSuccess") and data.get("token"):
+                    user_data = data.get("objects", {})
+                    
+                    # Extraer wallet del usuario - múltiples formatos posibles
+                    wallet_balance = 0
+                    
+                    # Formato 1: wallet como objeto con amount
+                    wallet_obj = user_data.get("wallet")
+                    if isinstance(wallet_obj, dict):
+                        wallet_balance = float(wallet_obj.get("amount", 0) or 0)
+                    elif wallet_obj is not None:
                         try:
-                            wallet_balance = float(balance)
+                            wallet_balance = float(wallet_obj)
                         except:
                             pass
-                
-                print(f"[DROPI LOGIN] SUCCESS - {email} - wallet: {wallet_balance} in {elapsed:.2f}s")
-                
-                return {
-                    "success": True, 
-                    "token": data["token"],
-                    "user_id": str(user_data.get("id", "")),
-                    "user_name": f"{user_data.get('name', '')} {user_data.get('surname', '')}".strip(),
-                    "wallet_balance": wallet_balance
-                }
-            else:
-                # Extraer mensaje de error
-                error_msg = data.get("message", "")
-                if not error_msg:
-                    error_msg = data.get("error", "")
-                if not error_msg:
-                    error_msg = str(data)[:200]
-                print(f"[DROPI LOGIN] FAILED - {email} - {error_msg} in {elapsed:.2f}s")
-                return {"success": False, "error": error_msg or "Login fallido"}
-                
-        except httpx.TimeoutException:
-            elapsed = time.time() - start_time
-            print(f"[DROPI LOGIN] TIMEOUT after {elapsed:.2f}s - {email}")
-            return {"success": False, "error": "Timeout conectando con Dropi (15s)"}
-        except httpx.RequestError as e:
-            elapsed = time.time() - start_time
-            print(f"[DROPI LOGIN] CONNECTION ERROR after {elapsed:.2f}s - {email} - {str(e)}")
-            return {"success": False, "error": f"Error de conexión: {str(e)}"}
-        except Exception as e:
-            elapsed = time.time() - start_time
-            print(f"[DROPI LOGIN] EXCEPTION after {elapsed:.2f}s - {email} - {str(e)}")
-            return {"success": False, "error": f"Error inesperado: {str(e)}"}
+                    
+                    # Formato 2: wallets como array
+                    if wallet_balance == 0:
+                        wallets = user_data.get("wallets", [])
+                        if wallets and isinstance(wallets, list):
+                            for w in wallets:
+                                if isinstance(w, dict) and w.get("amount"):
+                                    wallet_balance = float(w.get("amount", 0))
+                                    break
+                    
+                    # Formato 3: balance directo en user
+                    if wallet_balance == 0:
+                        balance = user_data.get("balance")
+                        if balance:
+                            try:
+                                wallet_balance = float(balance)
+                            except:
+                                pass
+                    
+                    print(f"[DROPI LOGIN] SUCCESS - {email} - wallet: {wallet_balance} in {elapsed:.2f}s")
+                    
+                    return {
+                        "success": True, 
+                        "token": data["token"],
+                        "user_id": str(user_data.get("id", "")),
+                        "user_name": f"{user_data.get('name', '')} {user_data.get('surname', '')}".strip(),
+                        "wallet_balance": wallet_balance
+                    }
+                else:
+                    # Extraer mensaje de error
+                    error_msg = data.get("message", "") or data.get("error", "") or "Login fallido"
+                    print(f"[DROPI LOGIN] FAILED - {email} - {error_msg} in {elapsed:.2f}s")
+                    return {"success": False, "error": error_msg}
+                    
+    except asyncio.TimeoutError:
+        elapsed = time.time() - start_time
+        print(f"[DROPI LOGIN] TIMEOUT after {elapsed:.2f}s - {email}")
+        return {"success": False, "error": "Dropi no responde (timeout 15s)"}
+    except httpx.TimeoutException:
+        elapsed = time.time() - start_time
+        print(f"[DROPI LOGIN] HTTP TIMEOUT after {elapsed:.2f}s - {email}")
+        return {"success": False, "error": "Timeout conectando con Dropi"}
+    except httpx.RequestError as e:
+        elapsed = time.time() - start_time
+        print(f"[DROPI LOGIN] CONNECTION ERROR after {elapsed:.2f}s - {email}")
+        return {"success": False, "error": f"Error de conexión: {str(e)[:100]}"}
+    except Exception as e:
+        elapsed = time.time() - start_time
+        print(f"[DROPI LOGIN] EXCEPTION after {elapsed:.2f}s - {email} - {type(e).__name__}")
+        return {"success": False, "error": f"Error: {str(e)[:100]}"}
 
 
 async def dropi_request(method: str, endpoint: str, token: str, country: str, params: dict = None, payload: dict = None) -> dict:
-    """Request genérico a la API de Dropi"""
+    """Request genérico a la API de Dropi con timeout real"""
     api_url = DROPI_API_URLS.get(country, DROPI_API_URLS["co"])
     url = f"{api_url}{endpoint}"
     
-    print(f"[DROPI REQUEST] {method} {url}")
-    print(f"[DROPI REQUEST] params: {params}")
-    
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        try:
-            if method == "GET":
-                response = await client.get(url, headers=get_dropi_headers(token, country), params=params)
-            else:
-                response = await client.post(url, headers=get_dropi_headers(token, country), json=payload)
-            
-            print(f"[DROPI REQUEST] Response status: {response.status_code}")
-            
-            if response.status_code == 401:
-                return {"success": False, "error": "Token expirado", "expired": True}
-            
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                    if data.get("isSuccess") == True:
-                        return {"success": True, "data": data}
-                    else:
-                        print(f"[DROPI REQUEST] API returned isSuccess=False: {data.get('message')}")
-                        return {"success": False, "error": data.get("message", "API error")}
-                except Exception as e:
-                    print(f"[DROPI REQUEST] JSON parse error: {e}")
-                    print(f"[DROPI REQUEST] Raw response: {response.text[:500]}")
-                    return {"success": False, "error": f"JSON parse error: {e}"}
-            else:
-                print(f"[DROPI REQUEST] Error response: {response.text[:500]}")
-                return {"success": False, "error": f"HTTP {response.status_code}"}
-        except Exception as e:
-            print(f"[DROPI REQUEST] Exception: {e}")
-            return {"success": False, "error": str(e)}
+    try:
+        # Timeout real de 30 segundos para requests de datos
+        async with asyncio.timeout(30):
+            async with httpx.AsyncClient(timeout=httpx.Timeout(25.0, connect=5.0)) as client:
+                if method == "GET":
+                    response = await client.get(url, headers=get_dropi_headers(token, country), params=params)
+                else:
+                    response = await client.post(url, headers=get_dropi_headers(token, country), json=payload)
+                
+                if response.status_code == 401:
+                    return {"success": False, "error": "Token expirado", "expired": True}
+                
+                if response.status_code == 200:
+                    try:
+                        data = response.json()
+                        if data.get("isSuccess") == True:
+                            return {"success": True, "data": data}
+                        else:
+                            return {"success": False, "error": data.get("message", "API error")}
+                    except Exception as e:
+                        return {"success": False, "error": f"JSON parse error"}
+                else:
+                    return {"success": False, "error": f"HTTP {response.status_code}"}
+                    
+    except asyncio.TimeoutError:
+        print(f"[DROPI REQUEST] TIMEOUT - {endpoint}")
+        return {"success": False, "error": "Dropi no responde (timeout 30s)"}
+    except Exception as e:
+        print(f"[DROPI REQUEST] ERROR - {endpoint} - {type(e).__name__}")
+        return {"success": False, "error": str(e)[:100]}
 
 
 async def ensure_dropi_token(connection: DropiConnection, db: Session) -> str:
@@ -453,15 +450,12 @@ async def get_wallet_history(
     db: Session = Depends(get_db)
 ):
     """Historial de movimientos de la wallet con datos diarios para gráficas"""
-    print(f"[WALLET HISTORY] Starting for user {current_user.id}")
-    
     connection = db.query(DropiConnection).filter(
         DropiConnection.user_id == current_user.id,
         DropiConnection.is_active == True
     ).first()
     
     if not connection:
-        print("[WALLET HISTORY] No connection found")
         return {"movements": [], "summary": {"total_in": 0, "total_out": 0, "net": 0, "count": 0}, "daily": [], "period": {}}
     
     # Hacer login fresco para obtener token válido
@@ -470,29 +464,25 @@ async def get_wallet_history(
     try:
         email = decrypt_token(connection.email_encrypted)
         password = decrypt_token(connection.password_encrypted)
-        print(f"[WALLET HISTORY] Doing fresh login...")
         login_result = await dropi_login(email, password, connection.country)
         if login_result.get("success"):
             token = login_result.get("token")
-            user_id = login_result.get("user_id")  # Guardar user_id del primer login
-            print(f"[WALLET HISTORY] Got token: {token[:20] if token else 'None'}...")
+            user_id = login_result.get("user_id")
             # Actualizar token en BD
             connection.current_token = token
             connection.token_expires_at = datetime.utcnow() + timedelta(hours=24)
             db.commit()
         else:
             error_msg = login_result.get('error', '')
-            print(f"[WALLET HISTORY] Login failed: {error_msg}")
             # Si credenciales incorrectas, desactivar conexión
             if "incorrecta" in error_msg.lower() or "denied" in error_msg.lower() or "bloqueo" in error_msg.lower():
                 connection.is_active = False
                 connection.current_token = None
                 db.commit()
     except Exception as e:
-        print(f"[WALLET HISTORY] Login exception: {e}")
+        pass
     
     if not token:
-        print("[WALLET HISTORY] No token, returning empty")
         return {"movements": [], "summary": {"total_in": 0, "total_out": 0, "net": 0, "count": 0}, "daily": [], "period": {}}
     
     # Calcular fechas primero
@@ -507,13 +497,7 @@ async def get_wallet_history(
         end_dt = datetime.now()
         start_dt = end_dt - timedelta(days=days)
     
-    print(f"[WALLET HISTORY] User ID: {user_id}")
-    
     # Llamar a historywallet con parámetros EXACTOS del MCP que funciona
-    print(f"[WALLET HISTORY] Calling /api/historywallet...")
-    print(f"[WALLET HISTORY] Date range: {start_dt.strftime('%Y-%m-%d')} to {end_dt.strftime('%Y-%m-%d')}")
-    
-    # Parámetros exactos del MCP funcional
     result = await dropi_request(
         "GET",
         "/api/historywallet",
@@ -530,39 +514,30 @@ async def get_wallet_history(
             "identification_code": "null",
             "user_id": user_id,
             "from": start_dt.strftime("%Y-%m-%d"),
-            "until": end_dt.strftime("%Y-%m-%d"),  # until, no untill
+            "until": end_dt.strftime("%Y-%m-%d"),
             "wallet_id": 0
         }
     )
     
-    print(f"[WALLET HISTORY] Result success: {result.get('success')}")
-    
     if not result.get("success"):
-        print(f"[WALLET HISTORY] API error: {result.get('error')}")
         return {"movements": [], "summary": {"total_in": 0, "total_out": 0, "net": 0, "count": 0}, "daily": [], "period": {}}
     
     data = result.get("data", {})
     records = data.get("objects", [])
-    print(f"[WALLET HISTORY] Got {len(records)} records")
-    
-    # Debug: mostrar primer registro si existe
-    if records and len(records) > 0:
-        print(f"[WALLET HISTORY] Sample record keys: {list(records[0].keys())}")
-        print(f"[WALLET HISTORY] Sample record: {records[0]}")
     
     filtered = []
     total_in = 0
     total_out = 0
     
     # Contadores específicos para dropshipping
-    total_ganancias = 0  # Solo "ENTRADA POR GANANCIA EN LA ORDEN COMO DROPSHIPPER"
-    total_devoluciones = 0  # Solo "SALIDA POR COBRO DE FLETE INICIAL"
-    count_ganancias = 0  # Número de entregas (para calcular promedio)
-    count_devoluciones = 0  # Número de devoluciones (para calcular promedio)
+    total_ganancias = 0
+    total_devoluciones = 0
+    count_ganancias = 0
+    count_devoluciones = 0
     
     # Diccionario para agrupar por día
     daily_data = {}
-    daily_dropshipping = {}  # Para el gráfico de ganancias vs devoluciones
+    daily_dropshipping = {}
     
     # Inicializar todos los días del período con 0
     try:
@@ -572,8 +547,8 @@ async def get_wallet_history(
             daily_data[day_key] = {"ingresos": 0, "egresos": 0, "date": day_key}
             daily_dropshipping[day_key] = {"ganancias": 0, "devoluciones": 0, "date": day_key}
             current_day += timedelta(days=1)
-    except Exception as e:
-        print(f"[WALLET HISTORY] Error initializing days: {e}")
+    except Exception:
+        pass
     
     # Procesar registros
     for record in records:
@@ -600,7 +575,7 @@ async def get_wallet_history(
                 # Detectar ganancias de dropshipping
                 if "ENTRADA POR GANANCIA EN LA ORDEN COMO DROPSHIPPER" in description:
                     total_ganancias += amount
-                    count_ganancias += 1  # Contar cada entrega
+                    count_ganancias += 1
                     if day_key in daily_dropshipping:
                         daily_dropshipping[day_key]["ganancias"] += amount
                         
@@ -612,7 +587,7 @@ async def get_wallet_history(
                 # Detectar cobros de flete (devoluciones)
                 if "SALIDA POR COBRO DE FLETE INICIAL" in description:
                     total_devoluciones += amount
-                    count_devoluciones += 1  # Contar cada devolución
+                    count_devoluciones += 1
                     if day_key in daily_dropshipping:
                         daily_dropshipping[day_key]["devoluciones"] += amount
             
@@ -625,8 +600,7 @@ async def get_wallet_history(
                 "order_id": record.get("order_id"),
                 "created_at": created_str
             })
-        except Exception as e:
-            print(f"[WALLET HISTORY] Error processing record: {e}")
+        except Exception:
             continue
     
     # Convertir daily_data a lista ordenada por fecha
@@ -651,10 +625,6 @@ async def get_wallet_history(
     # Calcular promedios
     promedio_ganancia = round(total_ganancias / count_ganancias, 2) if count_ganancias > 0 else 0
     promedio_devolucion = round(total_devoluciones / count_devoluciones, 2) if count_devoluciones > 0 else 0
-    
-    print(f"[WALLET HISTORY] Returning {len(filtered)} movements, {len(daily_list)} days")
-    print(f"[WALLET HISTORY] Dropshipping: ganancias={total_ganancias} ({count_ganancias} entregas), devoluciones={total_devoluciones} ({count_devoluciones} devs)")
-    print(f"[WALLET HISTORY] Promedios: ganancia={promedio_ganancia}, devolucion={promedio_devolucion}")
     
     return {
         "movements": filtered[:100],
@@ -693,8 +663,6 @@ async def _fetch_orders_stats(token: str, country: str, start_date: str = None, 
         end_dt = datetime.now()
         start_dt = end_dt - timedelta(days=days)
     
-    print(f"[DROPI DEBUG] Fetching orders from {start_dt} to {end_dt}")
-    
     # Obtener órdenes
     result = await dropi_request(
         "GET",
@@ -709,7 +677,6 @@ async def _fetch_orders_stats(token: str, country: str, start_date: str = None, 
     )
     
     if not result.get("success"):
-        print(f"[DROPI DEBUG] Error fetching orders: {result.get('error')}")
         return {
             "stats": {
                 "total": 0, "pending_confirmation": 0, "en_ruta": 0,
@@ -725,31 +692,17 @@ async def _fetch_orders_stats(token: str, country: str, start_date: str = None, 
     data = result.get("data", {})
     orders = data.get("objects", [])
     
-    print(f"[DROPI DEBUG] Total orders from API: {len(orders)}")
-    
-    # DEBUG: Ver los primeros 3 órdenes para entender la estructura
-    if orders:
-        for i, order in enumerate(orders[:3]):
-            print(f"[DROPI DEBUG] Order {i}: status={order.get('status')}, status_id={order.get('status_id')}, state={order.get('state')}, created_at={order.get('created_at', '')[:10]}")
-    
     # Categorización de estados para proyección de negocio
-    # - delivered: Ya entregados (cuentan para tasa de entrega)
-    # - returned: Ya devueltos (cuentan para tasa de entrega)
-    # - cancelled: Cancelados (NO cuentan para nada)
-    # - pending_confirmation: Pendientes de confirmar (NO cuentan - ni se enviaron)
-    # - en_ruta: TODO lo demás (en tránsito, estos son los "pendientes reales")
-    
     DELIVERED_STATES = {"ENTREGADO"}
     RETURNED_STATES = {"DEVOLUCION", "DEVOLUCIÓN"}
     CANCELLED_STATES = {"CANCELADO"}
     PENDING_CONFIRMATION_STATES = {"PENDIENTE", "PENDIENTE CONFIRMACION", "PENDIENTE CONFIRMACIÓN"}
-    # Todo lo demás es EN_RUTA: NOVEDAD, EN CAMINO, ENVIADO, EN REPARTO, EN BODEGA, GUÍA GENERADA, etc.
     
     # Contadores
     stats = {
         "total": 0,
-        "pending_confirmation": 0,  # Pedidos sin enviar
-        "en_ruta": 0,               # Pedidos en tránsito (pendientes reales)
+        "pending_confirmation": 0,
+        "en_ruta": 0,
         "delivered": 0,
         "returned": 0,
         "cancelled": 0,
@@ -759,8 +712,7 @@ async def _fetch_orders_stats(token: str, country: str, start_date: str = None, 
         "return_cost": 0,
     }
     
-    status_debug = {}  # Para contar qué status recibimos
-    daily_data = {}  # Para gráfico por día
+    daily_data = {}
     
     for order in orders:
         created_str = order.get("created_at", "")
@@ -775,16 +727,12 @@ async def _fetch_orders_stats(token: str, country: str, start_date: str = None, 
         if not (start_dt <= created_dt <= end_dt):
             continue
         
-        # Obtener status - es un string directo en español
+        # Obtener status
         status_raw = order.get("status", "")
         if isinstance(status_raw, dict):
             status_raw = status_raw.get("name", status_raw.get("id", "unknown"))
         
-        # Convertir a mayúsculas para comparar
         status_upper = str(status_raw).upper().strip()
-        
-        # Debug: contar status
-        status_debug[status_upper] = status_debug.get(status_upper, 0) + 1
         
         total_order = float(order.get("total_order", 0))
         profit = float(order.get("dropshipper_amount_to_win", 0))
@@ -798,15 +746,12 @@ async def _fetch_orders_stats(token: str, country: str, start_date: str = None, 
             stats["delivered_profit"] += profit
         elif status_upper in RETURNED_STATES:
             stats["returned"] += 1
-            stats["return_cost"] += 23000  # Costo fijo devolución Colombia
+            stats["return_cost"] += 23000
         elif status_upper in CANCELLED_STATES:
             stats["cancelled"] += 1
-            # No suma a nada más
         elif status_upper in PENDING_CONFIRMATION_STATES:
             stats["pending_confirmation"] += 1
-            # No suma a pending_profit porque ni se ha enviado
         else:
-            # Todo lo demás es EN_RUTA (NOVEDAD, EN CAMINO, ENVIADO, EN REPARTO, EN BODEGA, etc.)
             stats["en_ruta"] += 1
             stats["pending_profit"] += profit
         
@@ -819,8 +764,8 @@ async def _fetch_orders_stats(token: str, country: str, start_date: str = None, 
                 "returned": 0, 
                 "en_ruta": 0, 
                 "total": 0,
-                "ganancias": 0,  # Profit de entregas
-                "devoluciones": 0  # Costo de devoluciones
+                "ganancias": 0,
+                "devoluciones": 0
             }
         daily_data[day_key]["total"] += 1
         if status_upper in DELIVERED_STATES:
@@ -828,41 +773,23 @@ async def _fetch_orders_stats(token: str, country: str, start_date: str = None, 
             daily_data[day_key]["ganancias"] += profit
         elif status_upper in RETURNED_STATES:
             daily_data[day_key]["returned"] += 1
-            daily_data[day_key]["devoluciones"] += 23000  # Costo fijo devolución Colombia
+            daily_data[day_key]["devoluciones"] += 23000
         elif status_upper not in CANCELLED_STATES and status_upper not in PENDING_CONFIRMATION_STATES:
             daily_data[day_key]["en_ruta"] += 1
     
     # Convertir daily_data a lista ordenada por fecha
     daily_list = sorted(daily_data.values(), key=lambda x: x["date"])
     
-    print(f"[DROPI DEBUG] Status distribution: {status_debug}")
-    
     # Calcular métricas
     stats["net_profit"] = stats["delivered_profit"] - stats["return_cost"]
-    
-    # Tasa de entrega TOTAL (incluye cancelados y pendientes - no muy útil)
     stats["delivery_rate"] = round((stats["delivered"] / stats["total"] * 100) if stats["total"] > 0 else 0, 1)
     
-    # Tasa de entrega EFECTIVA (solo entregados vs entregados+devueltos - LA IMPORTANTE)
     completed = stats["delivered"] + stats["returned"]
     stats["effective_delivery_rate"] = round((stats["delivered"] / completed * 100) if completed > 0 else 0, 1)
-    
-    # Tasa de devolución EFECTIVA
     stats["effective_return_rate"] = round((stats["returned"] / completed * 100) if completed > 0 else 0, 1)
-    
-    # Total operativo (sin cancelados ni pendientes de confirmación)
     stats["total_operativo"] = stats["delivered"] + stats["returned"] + stats["en_ruta"]
-    
-    # Tasa de cancelación (cancelados vs total)
     stats["cancellation_rate"] = round((stats["cancelled"] / stats["total"] * 100) if stats["total"] > 0 else 0, 1)
-    
-    # % Operación completada (entregados + devueltos vs total operativo)
     stats["completion_rate"] = round((completed / stats["total_operativo"] * 100) if stats["total_operativo"] > 0 else 0, 1)
-    
-    print(f"[DROPI DEBUG] Orders in range: {stats['total']}")
-    print(f"[DROPI DEBUG] Delivered: {stats['delivered']}, Returned: {stats['returned']}, En Ruta: {stats['en_ruta']}")
-    print(f"[DROPI DEBUG] Cancelled: {stats['cancelled']}, Pending Confirmation: {stats['pending_confirmation']}")
-    print(f"[DROPI DEBUG] Effective delivery rate: {stats['effective_delivery_rate']}%, Completion: {stats['completion_rate']}%")
     
     return {
         "stats": stats,
@@ -920,12 +847,12 @@ async def get_orders(
     
     # Mapeo de estados
     STATUS_MAP = {
-        1: "pending",      # Pendiente
-        2: "confirmed",    # Confirmado
-        3: "shipped",      # Enviado
-        4: "delivered",    # Entregado
-        5: "returned",     # Devuelto
-        6: "cancelled",    # Cancelado
+        1: "pending",
+        2: "confirmed",
+        3: "shipped",
+        4: "delivered",
+        5: "returned",
+        6: "cancelled",
     }
     
     # Contadores y métricas
@@ -979,7 +906,7 @@ async def get_orders(
         elif status_name in ["pending", "confirmed", "shipped"]:
             stats["pending_profit"] += profit
         elif status_name == "returned":
-            stats["return_cost"] += 23000  # Costo fijo devolución Colombia
+            stats["return_cost"] += 23000
         
         filtered_orders.append({
             "id": order.get("id"),
@@ -1097,8 +1024,6 @@ async def get_dropi_summary(
             "message": "Conecta tu cuenta de Dropi para ver métricas"
         }
     
-    print(f"[DROPI DEBUG] Getting summary for user {current_user.id}, dates: {start_date} to {end_date}")
-    
     # Obtener wallet Y token fresco haciendo login
     wallet_balance = 0
     token = None
@@ -1116,8 +1041,6 @@ async def get_dropi_summary(
             wallet_balance = login_result.get("wallet_balance", 0)
             token = login_result.get("token")
             user_id = login_result.get("user_id")
-            print(f"[DROPI DEBUG] Wallet from fresh login: {wallet_balance}")
-            print(f"[DROPI DEBUG] Got fresh token: {token[:20] if token else 'None'}...")
             
             # Actualizar token en BD para futuras peticiones
             connection.current_token = token
@@ -1126,7 +1049,6 @@ async def get_dropi_summary(
         else:
             login_failed = True
             login_error_msg = login_result.get("error", "Login failed")
-            print(f"[DROPI DEBUG] Login FAILED: {login_error_msg}")
             
             # Si las credenciales son incorrectas, desactivar conexión y retornar INMEDIATAMENTE
             if "incorrecta" in login_error_msg.lower() or "denied" in login_error_msg.lower() or "bloqueo" in login_error_msg.lower():
@@ -1139,7 +1061,6 @@ async def get_dropi_summary(
                     "needs_reconnect": True
                 }
     except Exception as e:
-        print(f"[DROPI DEBUG] Error getting wallet from login: {e}")
         login_failed = True
         login_error_msg = str(e)
     
@@ -1156,8 +1077,6 @@ async def get_dropi_summary(
             "daily": []
         }
     
-    print(f"[DROPI DEBUG] Final wallet balance: {wallet_balance}")
-    
     # 1. Obtener órdenes del período
     orders_data = await _fetch_orders_stats(
         token=token,
@@ -1167,7 +1086,7 @@ async def get_dropi_summary(
         days=days
     )
     
-    # 2. Obtener TODO el wallet history (sin filtro de fecha) para cruzar
+    # 2. Obtener TODO el wallet history para cruzar
     wallet_history_result = await dropi_request(
         "GET",
         "/api/historywallet",
@@ -1176,26 +1095,25 @@ async def get_dropi_summary(
         params={
             "orderBy": "id",
             "orderDirection": "desc",
-            "result_number": 1000,  # Más registros para capturar todo
+            "result_number": 1000,
             "start": 0,
             "textToSearch": "",
             "type": "null",
             "id": "null",
             "identification_code": "null",
             "user_id": user_id,
-            "from": "2024-01-01",  # Fecha muy atrás para capturar todo
+            "from": "2024-01-01",
             "until": datetime.now().strftime("%Y-%m-%d"),
             "wallet_id": 0
         }
     )
     
     # 3. Crear mapa de order_id -> pago/cobro
-    pagos_por_order = {}  # order_id -> monto pagado (ganancias)
-    cobros_por_order = {}  # order_id -> monto cobrado (devoluciones)
+    pagos_por_order = {}
+    cobros_por_order = {}
     
     if wallet_history_result.get("success"):
         records = wallet_history_result.get("data", {}).get("objects", [])
-        print(f"[DROPI CRUCE] Procesando {len(records)} registros de wallet history")
         
         for record in records:
             description = record.get("description", "").upper()
@@ -1207,8 +1125,6 @@ async def get_dropi_summary(
                     pagos_por_order[order_id] = amount
                 elif "SALIDA POR COBRO DE FLETE INICIAL" in description:
                     cobros_por_order[order_id] = amount
-    
-    print(f"[DROPI CRUCE] Pagos encontrados: {len(pagos_por_order)}, Cobros encontrados: {len(cobros_por_order)}")
     
     # 4. Obtener órdenes raw para hacer el cruce detallado
     orders_raw = await _fetch_orders_for_reconciliation(
@@ -1245,7 +1161,7 @@ async def get_dropi_summary(
         order_id = order.get("id")
         status_upper = str(order.get("status", "")).upper().strip()
         profit = float(order.get("dropshipper_amount_to_win", 0))
-        created_str = order.get("created_at", "")[:10]  # YYYY-MM-DD
+        created_str = order.get("created_at", "")[:10]
         
         # Inicializar día si no existe
         if created_str not in daily_reconciled:
@@ -1260,31 +1176,26 @@ async def get_dropi_summary(
         
         if status_upper in DELIVERED_STATES:
             if order_id in pagos_por_order:
-                # Entregado Y pagado
                 reconciliation["entregas_cobradas"] += 1
                 reconciliation["entregas_cobradas_monto"] += pagos_por_order[order_id]
                 daily_reconciled[created_str]["ganancias_cobradas"] += pagos_por_order[order_id]
             else:
-                # Entregado pero NO pagado aún
                 reconciliation["entregas_pendientes"] += 1
                 reconciliation["entregas_pendientes_monto"] += profit
                 daily_reconciled[created_str]["ganancias_pendientes"] += profit
                 
         elif status_upper in RETURNED_STATES:
             if order_id in cobros_por_order:
-                # Devuelto Y cobrado
                 reconciliation["devoluciones_cobradas"] += 1
                 reconciliation["devoluciones_cobradas_monto"] += cobros_por_order[order_id]
                 daily_reconciled[created_str]["devoluciones_cobradas"] += cobros_por_order[order_id]
             else:
-                # Devuelto pero NO cobrado aún (usamos costo estimado)
-                costo_estimado = 23000  # Costo fijo Colombia
+                costo_estimado = 23000
                 reconciliation["devoluciones_pendientes"] += 1
                 reconciliation["devoluciones_pendientes_monto"] += costo_estimado
                 daily_reconciled[created_str]["devoluciones_pendientes"] += costo_estimado
                 
         elif status_upper not in CANCELLED_STATES and status_upper not in PENDING_CONFIRMATION_STATES:
-            # En ruta
             reconciliation["en_ruta"] += 1
             reconciliation["en_ruta_monto"] += profit
             daily_reconciled[created_str]["en_ruta"] += profit
@@ -1306,10 +1217,6 @@ async def get_dropi_summary(
             item["display_date"] = dt.strftime("%d/%m")
         except:
             item["display_date"] = item["date"]
-    
-    print(f"[DROPI CRUCE] Entregas: {reconciliation['entregas_cobradas']} cobradas, {reconciliation['entregas_pendientes']} pendientes")
-    print(f"[DROPI CRUCE] Devoluciones: {reconciliation['devoluciones_cobradas']} cobradas, {reconciliation['devoluciones_pendientes']} pendientes")
-    print(f"[DROPI CRUCE] Utilidad cobrada: {reconciliation['utilidad_cobrada']}, Pendiente neto: {reconciliation['pendiente_neto']}")
     
     return {
         "connected": True,
