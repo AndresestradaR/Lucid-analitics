@@ -238,7 +238,8 @@ def get_lucidbot_data_from_db(
 async def sync_ad_if_needed(
     db: Session,
     user_id: int,
-    api_token: str,
+    jwt_token: str,
+    page_id: str,
     ad_id: str,
     force: bool = False
 ) -> bool:
@@ -248,7 +249,8 @@ async def sync_ad_if_needed(
     Args:
         db: Sesión de BD
         user_id: ID del usuario
-        api_token: Token de LucidBot
+        jwt_token: JWT Token de LucidBot
+        page_id: Page ID de LucidBot
         ad_id: ID del anuncio
         force: Forzar sincronización aunque haya datos recientes
     
@@ -274,7 +276,7 @@ async def sync_ad_if_needed(
     from routers.sync import fetch_all_contacts_for_ad, sync_contacts_to_db
     
     # Obtener todos los contactos paginando
-    contacts = await fetch_all_contacts_for_ad(api_token, ad_id)
+    contacts = await fetch_all_contacts_for_ad(jwt_token, ad_id, page_id)
     
     if contacts:
         await sync_contacts_to_db(db, user_id, contacts, ad_id)
@@ -319,7 +321,13 @@ async def get_dashboard(
     ).first()
     
     meta_token = decrypt_token(meta_account.access_token_encrypted)
-    lucidbot_token = decrypt_token(lucidbot_conn.api_token_encrypted) if lucidbot_conn else None
+    
+    # Obtener JWT token y page_id de LucidBot
+    jwt_token = None
+    page_id = None
+    if lucidbot_conn and lucidbot_conn.jwt_token_encrypted:
+        jwt_token = decrypt_token(lucidbot_conn.jwt_token_encrypted)
+        page_id = lucidbot_conn.page_id
     
     # Obtener anuncios de Meta CON jerarquía
     meta_ads = await get_meta_ads_with_hierarchy(meta_token, account_id, start_date, end_date)
@@ -351,7 +359,7 @@ async def get_dashboard(
         spend = float(ad.get("spend", 0))
         
         # Obtener datos de LucidBot desde BD LOCAL
-        if lucidbot_token:
+        if jwt_token and page_id:
             # Verificar si hay datos en BD para este ad_id
             contact_count = db.query(func.count(LucidbotContact.id)).filter(
                 LucidbotContact.user_id == current_user.id,
@@ -362,7 +370,7 @@ async def get_dashboard(
             if contact_count == 0 and sync:
                 try:
                     synced = await sync_ad_if_needed(
-                        db, current_user.id, lucidbot_token, ad_id, force=True
+                        db, current_user.id, jwt_token, page_id, ad_id, force=True
                     )
                     if synced:
                         synced_ads.append(ad_id)
