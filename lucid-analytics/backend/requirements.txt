@@ -11,3 +11,4 @@ bcrypt==4.2.1
 python-jose==3.3.0
 cryptography==44.0.0
 python-multipart==0.0.20
+apscheduler>=3.10.0

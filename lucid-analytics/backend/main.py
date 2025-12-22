@@ -2,6 +2,8 @@
 Lucid Analytics - Backend API
 Dashboard de métricas para dropshipping COD
 Integra Meta Ads + LucidBot + Dropi para calcular CPA real
+
+CON SCHEDULER PARA SYNC AUTOMÁTICO
 """
 
 from fastapi import FastAPI, Depends, HTTPException, status
@@ -9,12 +11,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer
 from contextlib import asynccontextmanager
 import os
+import asyncio
 from dotenv import load_dotenv
 
 from database import create_tables, get_db, engine
 from routers import auth, meta, lucidbot, analytics, dropi, chat, sync, admin
 
+# APScheduler para sync automático
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+
 load_dotenv()
+
+# Scheduler global
+scheduler = AsyncIOScheduler()
 
 
 def run_migrations():
@@ -92,6 +102,44 @@ def run_migrations():
                 print(f"⚠️ Migración ya aplicada o error: {e}")
 
 
+async def scheduled_sync():
+    """
+    Función que se ejecuta cada 2 horas para sincronizar
+    LucidBot y Dropi de todos los usuarios.
+    """
+    print("\n" + "="*50)
+    print("🔄 [SCHEDULER] Iniciando sincronización automática...")
+    print("="*50)
+    
+    try:
+        # Importar funciones de sync
+        from routers.sync_dropi import sync_all_dropi_users
+        from routers.sync import sync_all_lucidbot_users
+        
+        # Sync Dropi
+        print("\n📦 [SCHEDULER] Sincronizando Dropi...")
+        try:
+            dropi_results = await sync_all_dropi_users()
+            print(f"✅ [SCHEDULER] Dropi: {len(dropi_results)} usuarios sincronizados")
+        except Exception as e:
+            print(f"❌ [SCHEDULER] Error Dropi: {e}")
+        
+        # Sync LucidBot
+        print("\n📡 [SCHEDULER] Sincronizando LucidBot...")
+        try:
+            lucidbot_results = await sync_all_lucidbot_users()
+            print(f"✅ [SCHEDULER] LucidBot: {len(lucidbot_results)} usuarios sincronizados")
+        except Exception as e:
+            print(f"❌ [SCHEDULER] Error LucidBot: {e}")
+        
+        print("\n" + "="*50)
+        print("✅ [SCHEDULER] Sincronización automática completada")
+        print("="*50 + "\n")
+        
+    except Exception as e:
+        print(f"\n❌ [SCHEDULER] Error general: {e}\n")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
@@ -100,14 +148,29 @@ async def lifespan(app: FastAPI):
     print("✅ Base de datos lista")
     run_migrations()
     print("✅ Migraciones completadas")
+    
+    # Iniciar scheduler
+    scheduler.add_job(
+        scheduled_sync,
+        IntervalTrigger(hours=2),
+        id="sync_all",
+        name="Sync LucidBot + Dropi cada 2 horas",
+        replace_existing=True
+    )
+    scheduler.start()
+    print("✅ Scheduler iniciado - Sync cada 2 horas")
+    
     yield
+    
     # Shutdown
     print("👋 Lucid Analytics cerrando...")
+    scheduler.shutdown()
+    print("✅ Scheduler detenido")
 
 app = FastAPI(
     title="Lucid Analytics API",
     description="Dashboard de métricas Meta Ads + LucidBot + Dropi para calcular CPA real",
-    version="2.2.0",
+    version="2.3.0",
     lifespan=lifespan
 )
 
@@ -135,14 +198,33 @@ async def root():
     return {
         "status": "ok",
         "service": "Lucid Analytics API",
-        "version": "2.2.0",
-        "features": ["Meta Ads", "LucidBot", "Dropi", "Chat IA", "Sync", "Admin"],
+        "version": "2.3.0",
+        "features": ["Meta Ads", "LucidBot", "Dropi", "Chat IA", "Sync", "Admin", "Scheduler"],
+        "scheduler": "running" if scheduler.running else "stopped",
         "docs": "/docs"
     }
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy"}
+    return {
+        "status": "healthy",
+        "scheduler": "running" if scheduler.running else "stopped",
+        "jobs": len(scheduler.get_jobs())
+    }
+
+
+@app.post("/api/cron/sync-all")
+async def cron_sync_all():
+    """
+    Endpoint para disparar sync manualmente o desde Railway Cron.
+    También se puede usar como backup si el scheduler falla.
+    """
+    asyncio.create_task(scheduled_sync())
+    return {
+        "status": "started",
+        "message": "Sincronización iniciada en background"
+    }
+
 
 if __name__ == "__main__":
     import uvicorn
