@@ -183,10 +183,10 @@ def sync_contacts_to_db(db: Session, user_id: int, contacts: List[dict], ad_id: 
                 "synced_at": datetime.utcnow(),
             }
             
-            # UPSERT usando SQL directo para mejor manejo de errores
+            # UPSERT usando índice compuesto (user_id, lucidbot_id)
             stmt = pg_insert(LucidbotContact).values(**contact_data)
             stmt = stmt.on_conflict_do_update(
-                index_elements=['lucidbot_id'],
+                index_elements=['user_id', 'lucidbot_id'],  # CAMBIADO: usar índice compuesto
                 set_={
                     "full_name": stmt.excluded.full_name,
                     "phone": stmt.excluded.phone,
