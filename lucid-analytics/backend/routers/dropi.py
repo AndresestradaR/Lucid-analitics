@@ -9,6 +9,7 @@ from typing import Optional
 from datetime import datetime, timedelta
 from pydantic import BaseModel
 import httpx
+import time
 
 from database import get_db, User, DropiConnection
 from routers.auth import get_current_user
@@ -91,6 +92,7 @@ async def dropi_login(email: str, password: str, country: str) -> dict:
     Hace login en Dropi y obtiene el token
     IDÉNTICO al MCP server que funciona
     """
+    start_time = time.time()
     api_url = DROPI_API_URLS.get(country, DROPI_API_URLS["co"])
     white_brand_id = WHITE_BRAND_IDS.get(country, WHITE_BRAND_IDS["co"])
     
@@ -106,21 +108,21 @@ async def dropi_login(email: str, password: str, country: str) -> dict:
         "with_cdc": False
     }
     
-    print(f"[DROPI DEBUG] URL: {url}")
-    print(f"[DROPI DEBUG] Country: {country}")
-    print(f"[DROPI DEBUG] Email: {email}")
-    print(f"[DROPI DEBUG] white_brand_id type: {type(white_brand_id)}")
+    print(f"[DROPI LOGIN] START - {email} at {datetime.now().isoformat()}")
+    print(f"[DROPI LOGIN] URL: {url}, Country: {country}")
     
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=15.0) as client:  # Reducido a 15s
         try:
+            print(f"[DROPI LOGIN] Sending request... ({time.time() - start_time:.2f}s)")
             response = await client.post(
                 url, 
                 json=payload, 
                 headers=get_dropi_headers(country=country)
             )
             
-            print(f"[DROPI DEBUG] Status: {response.status_code}")
-            print(f"[DROPI DEBUG] Response: {response.text[:500]}")
+            elapsed = time.time() - start_time
+            print(f"[DROPI LOGIN] Response in {elapsed:.2f}s - Status: {response.status_code}")
+            print(f"[DROPI LOGIN] Response: {response.text[:300]}")
             
             # Intentar parsear respuesta
             try:
@@ -139,40 +141,31 @@ async def dropi_login(email: str, password: str, country: str) -> dict:
                 wallet_obj = user_data.get("wallet")
                 if isinstance(wallet_obj, dict):
                     wallet_balance = float(wallet_obj.get("amount", 0) or 0)
-                    print(f"[DROPI DEBUG] Wallet from wallet.amount: {wallet_balance}")
                 elif wallet_obj is not None:
-                    # Formato 2: wallet como número directo
                     try:
                         wallet_balance = float(wallet_obj)
-                        print(f"[DROPI DEBUG] Wallet from wallet (direct): {wallet_balance}")
                     except:
                         pass
                 
-                # Formato 3: wallets como array
+                # Formato 2: wallets como array
                 if wallet_balance == 0:
                     wallets = user_data.get("wallets", [])
                     if wallets and isinstance(wallets, list):
                         for w in wallets:
                             if isinstance(w, dict) and w.get("amount"):
                                 wallet_balance = float(w.get("amount", 0))
-                                print(f"[DROPI DEBUG] Wallet from wallets[]: {wallet_balance}")
                                 break
                 
-                # Formato 4: balance directo en user
+                # Formato 3: balance directo en user
                 if wallet_balance == 0:
                     balance = user_data.get("balance")
                     if balance:
                         try:
                             wallet_balance = float(balance)
-                            print(f"[DROPI DEBUG] Wallet from balance: {wallet_balance}")
                         except:
                             pass
                 
-                # DEBUG: mostrar estructura de wallet para diagnóstico
-                print(f"[DROPI DEBUG] user_data keys: {list(user_data.keys())[:10]}")
-                print(f"[DROPI DEBUG] wallet raw: {user_data.get('wallet')}")
-                print(f"[DROPI DEBUG] wallets raw: {user_data.get('wallets')}")
-                print(f"[DROPI DEBUG] Final wallet_balance: {wallet_balance}")
+                print(f"[DROPI LOGIN] SUCCESS - {email} - wallet: {wallet_balance} in {elapsed:.2f}s")
                 
                 return {
                     "success": True, 
@@ -188,12 +181,21 @@ async def dropi_login(email: str, password: str, country: str) -> dict:
                     error_msg = data.get("error", "")
                 if not error_msg:
                     error_msg = str(data)[:200]
+                print(f"[DROPI LOGIN] FAILED - {email} - {error_msg} in {elapsed:.2f}s")
                 return {"success": False, "error": error_msg or "Login fallido"}
                 
         except httpx.TimeoutException:
-            return {"success": False, "error": "Timeout conectando con Dropi"}
+            elapsed = time.time() - start_time
+            print(f"[DROPI LOGIN] TIMEOUT after {elapsed:.2f}s - {email}")
+            return {"success": False, "error": "Timeout conectando con Dropi (15s)"}
         except httpx.RequestError as e:
+            elapsed = time.time() - start_time
+            print(f"[DROPI LOGIN] CONNECTION ERROR after {elapsed:.2f}s - {email} - {str(e)}")
             return {"success": False, "error": f"Error de conexión: {str(e)}"}
+        except Exception as e:
+            elapsed = time.time() - start_time
+            print(f"[DROPI LOGIN] EXCEPTION after {elapsed:.2f}s - {email} - {str(e)}")
+            return {"success": False, "error": f"Error inesperado: {str(e)}"}
 
 
 async def dropi_request(method: str, endpoint: str, token: str, country: str, params: dict = None, payload: dict = None) -> dict:
@@ -348,6 +350,38 @@ async def get_dropi_status(
         "dropi_user_name": connection.dropi_user_name,
         "created_at": connection.created_at.isoformat()
     }
+
+
+@router.post("/test-login")
+async def test_dropi_login(data: DropiConnectRequest):
+    """
+    Endpoint de debug para probar login a Dropi SIN guardar nada.
+    Útil para diagnosticar problemas de conexión.
+    """
+    print(f"[DROPI TEST] ========== Testing login for {data.email} ==========")
+    start = time.time()
+    
+    result = await dropi_login(data.email, data.password, data.country)
+    
+    elapsed = time.time() - start
+    print(f"[DROPI TEST] Completed in {elapsed:.2f}s - Success: {result.get('success')}")
+    
+    if result.get("success"):
+        return {
+            "success": True,
+            "user_id": result.get("user_id"),
+            "user_name": result.get("user_name"),
+            "wallet_balance": result.get("wallet_balance"),
+            "elapsed_seconds": round(elapsed, 2),
+            "message": "Login exitoso - credenciales válidas"
+        }
+    else:
+        return {
+            "success": False,
+            "error": result.get("error"),
+            "elapsed_seconds": round(elapsed, 2),
+            "message": f"Login falló: {result.get('error')}"
+        }
 
 
 @router.delete("/disconnect")
