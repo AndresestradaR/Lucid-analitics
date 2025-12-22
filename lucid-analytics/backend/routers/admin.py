@@ -1,6 +1,6 @@
 """
 Router de Administración
-Permite al admin gestionar tokens de LucidBot de todos los usuarios
+Permite al admin gestionar sincronización de LucidBot Y Dropi
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
@@ -12,7 +12,11 @@ from pydantic import BaseModel
 import httpx
 import json
 
-from database import get_db, User, LucidbotConnection, LucidbotContact
+from database import (
+    get_db, User, 
+    LucidbotConnection, LucidbotContact,
+    DropiConnection, DropiOrder, DropiWalletHistory
+)
 from routers.auth import get_current_user
 from utils import encrypt_token, decrypt_token
 
@@ -24,16 +28,23 @@ LUCIDBOT_PHP_URL = "https://panel.lucidbot.co/php/user.php"
 
 # ========== SCHEMAS ==========
 
-class UserLucidbotStatus(BaseModel):
+class UserSyncStatus(BaseModel):
     user_id: int
     email: str
     name: Optional[str]
-    has_jwt_token: bool
-    page_id: Optional[str]
-    token_expires: Optional[datetime]
-    total_contacts: int
-    total_ventas: int
-    last_sync: Optional[datetime]
+    # LucidBot
+    has_lucidbot_token: bool
+    lucidbot_page_id: Optional[str]
+    lucidbot_contacts: int
+    lucidbot_ventas: int
+    lucidbot_last_sync: Optional[datetime]
+    # Dropi
+    has_dropi_connection: bool
+    dropi_country: Optional[str]
+    dropi_orders: int
+    dropi_wallet_movements: int
+    dropi_sync_status: Optional[str]
+    dropi_last_sync: Optional[datetime]
 
 
 class SetUserTokenRequest(BaseModel):
@@ -43,6 +54,10 @@ class SetUserTokenRequest(BaseModel):
 
 
 class SyncUserRequest(BaseModel):
+    user_id: int
+
+
+class SyncDropiRequest(BaseModel):
     user_id: int
 
 
@@ -59,7 +74,7 @@ def require_admin(current_user: User = Depends(get_current_user)):
 
 
 async def validate_jwt_token(jwt_token: str, page_id: str) -> dict:
-    """Validar que el JWT token funciona"""
+    """Validar que el JWT token de LucidBot funciona"""
     headers = {
         "Content-Type": "application/json",
         "Cookie": f"token={jwt_token}; last_page_id={page_id}"
@@ -107,92 +122,91 @@ async def validate_jwt_token(jwt_token: str, page_id: str) -> dict:
 
 # ========== ENDPOINTS ==========
 
-@router.get("/users", response_model=List[UserLucidbotStatus])
+@router.get("/users", response_model=List[UserSyncStatus])
 async def get_all_users_status(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db)
 ):
-    """Obtener estado de todos los usuarios con sus conexiones de LucidBot"""
+    """Obtener estado de todos los usuarios con sus conexiones"""
     
     users = db.query(User).filter(User.is_active == True).all()
     
     result = []
     for user in users:
-        # Buscar conexión de LucidBot
-        connection = db.query(LucidbotConnection).filter(
+        # ========== LUCIDBOT ==========
+        lucidbot_conn = db.query(LucidbotConnection).filter(
             LucidbotConnection.user_id == user.id,
             LucidbotConnection.is_active == True
         ).first()
         
-        # Contar contactos y ventas
-        total_contacts = db.query(func.count(LucidbotContact.id)).filter(
+        lucidbot_contacts = db.query(func.count(LucidbotContact.id)).filter(
             LucidbotContact.user_id == user.id
         ).scalar() or 0
         
-        total_ventas = db.query(func.count(LucidbotContact.id)).filter(
+        lucidbot_ventas = db.query(func.count(LucidbotContact.id)).filter(
             LucidbotContact.user_id == user.id,
             LucidbotContact.total_a_pagar > 0
         ).scalar() or 0
         
-        # Última sincronización
-        last_contact = db.query(LucidbotContact).filter(
+        last_lucidbot_contact = db.query(LucidbotContact).filter(
             LucidbotContact.user_id == user.id
         ).order_by(LucidbotContact.synced_at.desc()).first()
         
-        # Decodificar token para ver expiración
-        token_expires = None
-        if connection and connection.jwt_token_encrypted:
-            try:
-                jwt_token = decrypt_token(connection.jwt_token_encrypted)
-                # Decodificar JWT para obtener expiración
-                import base64
-                parts = jwt_token.split('.')
-                if len(parts) >= 2:
-                    payload = parts[1]
-                    # Agregar padding si es necesario
-                    payload += '=' * (4 - len(payload) % 4)
-                    decoded = json.loads(base64.b64decode(payload))
-                    if "expire" in decoded:
-                        token_expires = datetime.fromtimestamp(decoded["expire"])
-            except:
-                pass
+        # ========== DROPI ==========
+        dropi_conn = db.query(DropiConnection).filter(
+            DropiConnection.user_id == user.id,
+            DropiConnection.is_active == True
+        ).first()
         
-        result.append(UserLucidbotStatus(
+        dropi_orders = db.query(func.count(DropiOrder.id)).filter(
+            DropiOrder.user_id == user.id
+        ).scalar() or 0
+        
+        dropi_wallet = db.query(func.count(DropiWalletHistory.id)).filter(
+            DropiWalletHistory.user_id == user.id
+        ).scalar() or 0
+        
+        result.append(UserSyncStatus(
             user_id=user.id,
             email=user.email,
             name=user.name,
-            has_jwt_token=bool(connection and connection.jwt_token_encrypted),
-            page_id=connection.page_id if connection else None,
-            token_expires=token_expires,
-            total_contacts=total_contacts,
-            total_ventas=total_ventas,
-            last_sync=last_contact.synced_at if last_contact else None
+            # LucidBot
+            has_lucidbot_token=bool(lucidbot_conn and lucidbot_conn.jwt_token_encrypted),
+            lucidbot_page_id=lucidbot_conn.page_id if lucidbot_conn else None,
+            lucidbot_contacts=lucidbot_contacts,
+            lucidbot_ventas=lucidbot_ventas,
+            lucidbot_last_sync=last_lucidbot_contact.synced_at if last_lucidbot_contact else None,
+            # Dropi
+            has_dropi_connection=bool(dropi_conn),
+            dropi_country=dropi_conn.country if dropi_conn else None,
+            dropi_orders=dropi_orders,
+            dropi_wallet_movements=dropi_wallet,
+            dropi_sync_status=dropi_conn.sync_status if dropi_conn else None,
+            dropi_last_sync=dropi_conn.last_orders_sync if dropi_conn else None
         ))
     
     return result
 
 
-@router.post("/set-token")
-async def set_user_token(
+# ========== LUCIDBOT ENDPOINTS ==========
+
+@router.post("/lucidbot/set-token")
+async def set_lucidbot_token(
     data: SetUserTokenRequest,
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db)
 ):
-    """Configurar JWT token de LucidBot para un usuario específico"""
+    """Configurar JWT token de LucidBot para un usuario"""
     
-    # Verificar que el usuario existe
     user = db.query(User).filter(User.id == data.user_id).first()
     if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Usuario no encontrado"
-        )
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
     
     # Validar token
     validation = await validate_jwt_token(data.jwt_token, data.page_id)
     if not validation.get("success"):
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=400,
             detail=f"Token inválido: {validation.get('error')}"
         )
     
@@ -224,77 +238,55 @@ async def set_user_token(
     }
 
 
-@router.post("/sync-user")
-async def sync_user_contacts(
+@router.post("/lucidbot/sync-user")
+async def sync_lucidbot_user(
     data: SyncUserRequest,
     background_tasks: BackgroundTasks,
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db)
 ):
-    """Iniciar sincronización de contactos para un usuario específico"""
+    """Sincronizar LucidBot para un usuario"""
     
-    # Verificar que el usuario existe
     user = db.query(User).filter(User.id == data.user_id).first()
     if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Usuario no encontrado"
-        )
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
     
-    # Verificar que tiene token configurado
     connection = db.query(LucidbotConnection).filter(
         LucidbotConnection.user_id == data.user_id,
         LucidbotConnection.is_active == True
     ).first()
     
     if not connection or not connection.jwt_token_encrypted:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"El usuario {user.email} no tiene JWT token configurado"
-        )
+        raise HTTPException(status_code=400, detail=f"El usuario {user.email} no tiene token configurado")
     
     jwt_token = decrypt_token(connection.jwt_token_encrypted)
     page_id = connection.page_id
     
-    # Importar la función de sync
     from routers.sync import sync_contacts_background
-    
-    # Ejecutar sync en background
-    background_tasks.add_task(
-        sync_contacts_background,
-        data.user_id,
-        jwt_token,
-        page_id
-    )
+    background_tasks.add_task(sync_contacts_background, data.user_id, jwt_token, page_id)
     
     return {
         "success": True,
-        "message": f"Sincronización iniciada para {user.email}",
-        "status": "processing"
+        "message": f"Sincronización LucidBot iniciada para {user.email}"
     }
 
 
-@router.post("/sync-all")
-async def sync_all_users(
+@router.post("/lucidbot/sync-all")
+async def sync_all_lucidbot(
     background_tasks: BackgroundTasks,
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db)
 ):
-    """Sincronizar todos los usuarios que tienen token configurado"""
+    """Sincronizar LucidBot para todos los usuarios con token"""
     
-    # Obtener todas las conexiones activas con token
     connections = db.query(LucidbotConnection).filter(
         LucidbotConnection.is_active == True,
         LucidbotConnection.jwt_token_encrypted != None
     ).all()
     
     if not connections:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No hay usuarios con token configurado"
-        )
+        raise HTTPException(status_code=400, detail="No hay usuarios con token configurado")
     
-    # Importar la función de sync
     from routers.sync import sync_contacts_background
     
     synced_users = []
@@ -302,12 +294,7 @@ async def sync_all_users(
         user = db.query(User).filter(User.id == conn.user_id).first()
         if user:
             jwt_token = decrypt_token(conn.jwt_token_encrypted)
-            background_tasks.add_task(
-                sync_contacts_background,
-                conn.user_id,
-                jwt_token,
-                conn.page_id
-            )
+            background_tasks.add_task(sync_contacts_background, conn.user_id, jwt_token, conn.page_id)
             synced_users.append(user.email)
     
     return {
@@ -317,20 +304,17 @@ async def sync_all_users(
     }
 
 
-@router.delete("/clear-contacts/{user_id}")
-async def clear_user_contacts(
+@router.delete("/lucidbot/clear-contacts/{user_id}")
+async def clear_lucidbot_contacts(
     user_id: int,
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db)
 ):
-    """Eliminar todos los contactos de un usuario (para re-sincronizar)"""
+    """Eliminar contactos de LucidBot de un usuario"""
     
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Usuario no encontrado"
-        )
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
     
     deleted = db.query(LucidbotContact).filter(
         LucidbotContact.user_id == user_id
@@ -341,4 +325,215 @@ async def clear_user_contacts(
     return {
         "success": True,
         "message": f"Eliminados {deleted} contactos de {user.email}"
+    }
+
+
+# ========== DROPI ENDPOINTS ==========
+
+@router.post("/dropi/sync-user")
+async def sync_dropi_user(
+    data: SyncDropiRequest,
+    background_tasks: BackgroundTasks,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Sincronizar Dropi para un usuario"""
+    
+    user = db.query(User).filter(User.id == data.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    
+    connection = db.query(DropiConnection).filter(
+        DropiConnection.user_id == data.user_id,
+        DropiConnection.is_active == True
+    ).first()
+    
+    if not connection:
+        raise HTTPException(status_code=400, detail=f"El usuario {user.email} no tiene Dropi conectado")
+    
+    from routers.sync_dropi import sync_dropi_background
+    background_tasks.add_task(sync_dropi_background, data.user_id)
+    
+    # Marcar como sincronizando
+    connection.sync_status = "syncing"
+    db.commit()
+    
+    return {
+        "success": True,
+        "message": f"Sincronización Dropi iniciada para {user.email}"
+    }
+
+
+@router.post("/dropi/sync-all")
+async def sync_all_dropi(
+    background_tasks: BackgroundTasks,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Sincronizar Dropi para todos los usuarios conectados"""
+    
+    connections = db.query(DropiConnection).filter(
+        DropiConnection.is_active == True
+    ).all()
+    
+    if not connections:
+        raise HTTPException(status_code=400, detail="No hay usuarios con Dropi conectado")
+    
+    from routers.sync_dropi import sync_dropi_background
+    
+    synced_users = []
+    for conn in connections:
+        user = db.query(User).filter(User.id == conn.user_id).first()
+        if user:
+            background_tasks.add_task(sync_dropi_background, conn.user_id)
+            conn.sync_status = "syncing"
+            synced_users.append(user.email)
+    
+    db.commit()
+    
+    return {
+        "success": True,
+        "message": f"Sincronización Dropi iniciada para {len(synced_users)} usuarios",
+        "users": synced_users
+    }
+
+
+@router.delete("/dropi/clear-data/{user_id}")
+async def clear_dropi_data(
+    user_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Eliminar datos de Dropi de un usuario (para re-sincronizar)"""
+    
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    
+    deleted_orders = db.query(DropiOrder).filter(
+        DropiOrder.user_id == user_id
+    ).delete()
+    
+    deleted_wallet = db.query(DropiWalletHistory).filter(
+        DropiWalletHistory.user_id == user_id
+    ).delete()
+    
+    # Reset sync status
+    connection = db.query(DropiConnection).filter(
+        DropiConnection.user_id == user_id
+    ).first()
+    if connection:
+        connection.last_orders_sync = None
+        connection.last_wallet_sync = None
+        connection.sync_status = "pending"
+    
+    db.commit()
+    
+    return {
+        "success": True,
+        "message": f"Eliminados {deleted_orders} órdenes y {deleted_wallet} movimientos de wallet de {user.email}"
+    }
+
+
+@router.get("/dropi/sync-status/{user_id}")
+async def get_dropi_sync_status(
+    user_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Obtener estado de sincronización de Dropi para un usuario"""
+    
+    connection = db.query(DropiConnection).filter(
+        DropiConnection.user_id == user_id
+    ).first()
+    
+    if not connection:
+        return {"connected": False}
+    
+    orders_count = db.query(func.count(DropiOrder.id)).filter(
+        DropiOrder.user_id == user_id
+    ).scalar() or 0
+    
+    wallet_count = db.query(func.count(DropiWalletHistory.id)).filter(
+        DropiWalletHistory.user_id == user_id
+    ).scalar() or 0
+    
+    # Stats de órdenes
+    delivered = db.query(func.count(DropiOrder.id)).filter(
+        DropiOrder.user_id == user_id,
+        DropiOrder.status == "ENTREGADO"
+    ).scalar() or 0
+    
+    returned = db.query(func.count(DropiOrder.id)).filter(
+        DropiOrder.user_id == user_id,
+        DropiOrder.status == "DEVOLUCION"
+    ).scalar() or 0
+    
+    paid = db.query(func.count(DropiOrder.id)).filter(
+        DropiOrder.user_id == user_id,
+        DropiOrder.is_paid == True
+    ).scalar() or 0
+    
+    return {
+        "connected": True,
+        "sync_status": connection.sync_status,
+        "last_orders_sync": connection.last_orders_sync.isoformat() if connection.last_orders_sync else None,
+        "last_wallet_sync": connection.last_wallet_sync.isoformat() if connection.last_wallet_sync else None,
+        "total_orders": orders_count,
+        "total_wallet_movements": wallet_count,
+        "delivered": delivered,
+        "returned": returned,
+        "paid_orders": paid
+    }
+
+
+# ========== SYNC ALL (LUCIDBOT + DROPI) ==========
+
+@router.post("/sync-all")
+async def sync_all_platforms(
+    background_tasks: BackgroundTasks,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Sincronizar LucidBot Y Dropi para todos los usuarios"""
+    
+    results = {"lucidbot": [], "dropi": []}
+    
+    # LucidBot
+    lucidbot_conns = db.query(LucidbotConnection).filter(
+        LucidbotConnection.is_active == True,
+        LucidbotConnection.jwt_token_encrypted != None
+    ).all()
+    
+    from routers.sync import sync_contacts_background
+    
+    for conn in lucidbot_conns:
+        user = db.query(User).filter(User.id == conn.user_id).first()
+        if user:
+            jwt_token = decrypt_token(conn.jwt_token_encrypted)
+            background_tasks.add_task(sync_contacts_background, conn.user_id, jwt_token, conn.page_id)
+            results["lucidbot"].append(user.email)
+    
+    # Dropi
+    dropi_conns = db.query(DropiConnection).filter(
+        DropiConnection.is_active == True
+    ).all()
+    
+    from routers.sync_dropi import sync_dropi_background
+    
+    for conn in dropi_conns:
+        user = db.query(User).filter(User.id == conn.user_id).first()
+        if user:
+            background_tasks.add_task(sync_dropi_background, conn.user_id)
+            conn.sync_status = "syncing"
+            results["dropi"].append(user.email)
+    
+    db.commit()
+    
+    return {
+        "success": True,
+        "message": f"Sincronización iniciada",
+        "lucidbot_users": len(results["lucidbot"]),
+        "dropi_users": len(results["dropi"]),
+        "details": results
     }
