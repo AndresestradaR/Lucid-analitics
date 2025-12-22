@@ -49,7 +49,7 @@ def run_migrations():
         CREATE TABLE IF NOT EXISTS lucidbot_contacts (
             id SERIAL PRIMARY KEY,
             user_id INTEGER NOT NULL REFERENCES users(id),
-            lucidbot_id INTEGER UNIQUE NOT NULL,
+            lucidbot_id BIGINT NOT NULL,
             full_name VARCHAR(255),
             phone VARCHAR(50),
             ad_id VARCHAR(100),
@@ -61,7 +61,25 @@ def run_migrations():
             updated_at TIMESTAMP DEFAULT NOW()
         );
         """,
-        # Crear índices si no existen
+        # Crear índice único compuesto para UPSERT - ESTE ES EL IMPORTANTE
+        """
+        DO $$
+        BEGIN
+            -- Primero eliminar el constraint único simple si existe
+            IF EXISTS (
+                SELECT 1 FROM pg_constraint 
+                WHERE conname = 'lucidbot_contacts_lucidbot_id_key'
+            ) THEN
+                ALTER TABLE lucidbot_contacts DROP CONSTRAINT lucidbot_contacts_lucidbot_id_key;
+            END IF;
+            
+            -- Crear índice único compuesto
+            IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_lucidbot_contacts_user_lucidbot') THEN
+                CREATE UNIQUE INDEX idx_lucidbot_contacts_user_lucidbot ON lucidbot_contacts(user_id, lucidbot_id);
+            END IF;
+        END $$;
+        """,
+        # Crear otros índices si no existen
         """
         DO $$
         BEGIN
@@ -259,6 +277,11 @@ async def scheduled_sync():
         try:
             dropi_results = await sync_all_dropi_users()
             print(f"✅ [SCHEDULER] Dropi: {len(dropi_results)} usuarios sincronizados")
+            for r in dropi_results:
+                if r.get("result", {}).get("success"):
+                    print(f"   - {r['email']}: {r['result'].get('orders_synced', 0)} orders, {r['result'].get('wallet_synced', 0)} wallet")
+                else:
+                    print(f"   - {r['email']}: ERROR - {r['result'].get('error', 'Unknown')}")
         except Exception as e:
             print(f"❌ [SCHEDULER] Error Dropi: {e}")
         
@@ -267,6 +290,11 @@ async def scheduled_sync():
         try:
             lucidbot_results = await sync_all_lucidbot_users()
             print(f"✅ [SCHEDULER] LucidBot: {len(lucidbot_results)} usuarios sincronizados")
+            for r in lucidbot_results:
+                if r.get("result", {}).get("success"):
+                    print(f"   - {r['email']}: {r['result'].get('synced', 0)} contacts")
+                else:
+                    print(f"   - {r['email']}: ERROR - {r['result'].get('error', 'Unknown')}")
         except Exception as e:
             print(f"❌ [SCHEDULER] Error LucidBot: {e}")
         
@@ -308,7 +336,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Lucid Analytics API",
     description="Dashboard de métricas Meta Ads + LucidBot + Dropi para calcular CPA real",
-    version="2.3.1",
+    version="2.4.0",
     lifespan=lifespan
 )
 
@@ -336,7 +364,7 @@ async def root():
     return {
         "status": "ok",
         "service": "Lucid Analytics API",
-        "version": "2.3.1",
+        "version": "2.4.0",
         "features": ["Meta Ads", "LucidBot", "Dropi", "Chat IA", "Sync", "Admin", "Scheduler"],
         "scheduler": "running" if scheduler.running else "stopped",
         "docs": "/docs"
