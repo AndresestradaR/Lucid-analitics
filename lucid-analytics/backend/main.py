@@ -326,6 +326,15 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     print("✅ Scheduler iniciado - Sync cada 2 horas")
     
+    # Ejecutar sync inicial después de 30 segundos (dar tiempo a que arranque todo)
+    async def delayed_initial_sync():
+        await asyncio.sleep(30)
+        print("\n🚀 [STARTUP] Ejecutando sync inicial...")
+        await scheduled_sync()
+    
+    asyncio.create_task(delayed_initial_sync())
+    print("✅ Sync inicial programado para 30 segundos")
+    
     yield
     
     # Shutdown
@@ -336,7 +345,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Lucid Analytics API",
     description="Dashboard de métricas Meta Ads + LucidBot + Dropi para calcular CPA real",
-    version="2.4.0",
+    version="2.5.0",
     lifespan=lifespan
 )
 
@@ -364,7 +373,7 @@ async def root():
     return {
         "status": "ok",
         "service": "Lucid Analytics API",
-        "version": "2.4.0",
+        "version": "2.5.0",
         "features": ["Meta Ads", "LucidBot", "Dropi", "Chat IA", "Sync", "Admin", "Scheduler"],
         "scheduler": "running" if scheduler.running else "stopped",
         "docs": "/docs"
