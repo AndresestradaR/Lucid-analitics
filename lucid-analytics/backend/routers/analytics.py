@@ -276,7 +276,8 @@ async def sync_ad_if_needed(
     contacts = await fetch_all_contacts_for_ad(jwt_token, ad_id, page_id)
     
     if contacts:
-        await sync_contacts_to_db(db, user_id, contacts, ad_id)
+        # FIX: sync_contacts_to_db es SÍNCRONO, no usar await
+        sync_contacts_to_db(db, user_id, contacts, ad_id)
         return True
     
     return False
