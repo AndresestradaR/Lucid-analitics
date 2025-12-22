@@ -244,7 +244,7 @@ async def sync_dropi_orders_for_user(
     print(f"[DROPI SYNC] Starting orders sync for user {user_id}, full_sync={full_sync}")
     
     total_synced = 0
-    total_updated = 0
+    total_errors = 0
     page = 0
     limit = 100
     
@@ -355,12 +355,23 @@ async def sync_dropi_orders_for_user(
                 db.execute(stmt)
                 total_synced += 1
                 
+                # Commit cada 50 órdenes para evitar transacciones muy largas
+                if total_synced % 50 == 0:
+                    db.commit()
+                
             except Exception as e:
-                print(f"[DROPI SYNC] Error processing order {order.get('id')}: {e}")
+                total_errors += 1
+                db.rollback()  # IMPORTANTE: Rollback para poder continuar
+                if total_errors <= 3:
+                    print(f"[DROPI SYNC] Error processing order {order.get('id')}: {e}")
                 continue
         
-        # Commit cada página
-        db.commit()
+        # Commit al final de cada página
+        try:
+            db.commit()
+        except Exception as e:
+            print(f"[DROPI SYNC] Error committing page {page}: {e}")
+            db.rollback()
         
         # Si recibimos menos órdenes que el límite, ya no hay más
         if len(orders) < limit:
@@ -368,8 +379,8 @@ async def sync_dropi_orders_for_user(
         
         page += 1
     
-    print(f"[DROPI SYNC] Orders sync completed: {total_synced} orders synced")
-    return {"success": True, "synced": total_synced}
+    print(f"[DROPI SYNC] Orders sync completed: {total_synced} orders synced, {total_errors} errors")
+    return {"success": True, "synced": total_synced, "errors": total_errors}
 
 
 async def sync_dropi_wallet_for_user(
@@ -386,6 +397,7 @@ async def sync_dropi_wallet_for_user(
     print(f"[DROPI SYNC] Starting wallet sync for user {user_id}")
     
     total_synced = 0
+    total_errors = 0
     page = 0
     limit = 500
     
@@ -458,19 +470,30 @@ async def sync_dropi_wallet_for_user(
                 db.execute(stmt)
                 total_synced += 1
                 
+                # Commit cada 100 movimientos
+                if total_synced % 100 == 0:
+                    db.commit()
+                
             except Exception as e:
-                print(f"[DROPI SYNC] Error processing wallet movement {mov.get('id')}: {e}")
+                total_errors += 1
+                db.rollback()  # IMPORTANTE: Rollback para poder continuar
+                if total_errors <= 3:
+                    print(f"[DROPI SYNC] Error processing wallet movement {mov.get('id')}: {e}")
                 continue
         
-        db.commit()
+        try:
+            db.commit()
+        except Exception as e:
+            print(f"[DROPI SYNC] Error committing wallet page {page}: {e}")
+            db.rollback()
         
         if len(movements) < limit:
             break
         
         page += 1
     
-    print(f"[DROPI SYNC] Wallet sync completed: {total_synced} movements synced")
-    return {"success": True, "synced": total_synced}
+    print(f"[DROPI SYNC] Wallet sync completed: {total_synced} movements synced, {total_errors} errors")
+    return {"success": True, "synced": total_synced, "errors": total_errors}
 
 
 async def reconcile_orders_wallet(user_id: int, db: Session) -> dict:
@@ -480,78 +503,94 @@ async def reconcile_orders_wallet(user_id: int, db: Session) -> dict:
     """
     print(f"[DROPI SYNC] Starting reconciliation for user {user_id}")
     
-    # 1. Obtener todos los movimientos de ganancia con order_id
-    ganancias = db.query(DropiWalletHistory).filter(
-        DropiWalletHistory.user_id == user_id,
-        DropiWalletHistory.category == "ganancia_dropshipping",
-        DropiWalletHistory.order_id != None
-    ).all()
-    
-    # 2. Obtener todos los cobros de flete con order_id
-    cobros = db.query(DropiWalletHistory).filter(
-        DropiWalletHistory.user_id == user_id,
-        DropiWalletHistory.category == "cobro_flete",
-        DropiWalletHistory.order_id != None
-    ).all()
-    
-    # 3. Crear mapas order_id -> wallet_movement
-    pagos_map = {g.order_id: g for g in ganancias}
-    cobros_map = {c.order_id: c for c in cobros}
-    
-    print(f"[DROPI SYNC] Found {len(pagos_map)} payments, {len(cobros_map)} charges")
-    
-    # 4. Actualizar órdenes con info de pago
-    updated_paid = 0
-    updated_charged = 0
-    
-    # Marcar órdenes pagadas
-    for order_id, wallet_mov in pagos_map.items():
-        result = db.execute(
-            text("""
-                UPDATE dropi_orders 
-                SET is_paid = true, 
-                    paid_at = :paid_at, 
-                    paid_amount = :amount,
-                    wallet_transaction_id = :wallet_id,
-                    updated_at = :now
-                WHERE user_id = :user_id AND dropi_order_id = :order_id AND is_paid = false
-            """),
-            {
-                "paid_at": wallet_mov.movement_created_at,
-                "amount": wallet_mov.amount,
-                "wallet_id": wallet_mov.dropi_wallet_id,
-                "now": datetime.utcnow(),
-                "user_id": user_id,
-                "order_id": order_id
-            }
-        )
-        updated_paid += result.rowcount
-    
-    # Marcar órdenes con devolución cobrada
-    for order_id, wallet_mov in cobros_map.items():
-        result = db.execute(
-            text("""
-                UPDATE dropi_orders 
-                SET is_return_charged = true, 
-                    return_charged_at = :charged_at, 
-                    return_charged_amount = :amount,
-                    updated_at = :now
-                WHERE user_id = :user_id AND dropi_order_id = :order_id AND is_return_charged = false
-            """),
-            {
-                "charged_at": wallet_mov.movement_created_at,
-                "amount": wallet_mov.amount,
-                "now": datetime.utcnow(),
-                "user_id": user_id,
-                "order_id": order_id
-            }
-        )
-        updated_charged += result.rowcount
-    
-    db.commit()
-    
-    print(f"[DROPI SYNC] Reconciliation completed: {updated_paid} paid, {updated_charged} charged")
-    return {"success": True, "updated_paid": updated_paid, "updated_charged": updated_charged}
+    try:
+        # 1. Obtener todos los movimientos de ganancia con order_id
+        ganancias = db.query(DropiWalletHistory).filter(
+            DropiWalletHistory.user_id == user_id,
+            DropiWalletHistory.category == "ganancia_dropshipping",
+            DropiWalletHistory.order_id != None
+        ).all()
+        
+        # 2. Obtener todos los cobros de flete con order_id
+        cobros = db.query(DropiWalletHistory).filter(
+            DropiWalletHistory.user_id == user_id,
+            DropiWalletHistory.category == "cobro_flete",
+            DropiWalletHistory.order_id != None
+        ).all()
+        
+        # 3. Crear mapas order_id -> wallet_movement
+        pagos_map = {g.order_id: g for g in ganancias}
+        cobros_map = {c.order_id: c for c in cobros}
+        
+        print(f"[DROPI SYNC] Found {len(pagos_map)} payments, {len(cobros_map)} charges")
+        
+        # 4. Actualizar órdenes con info de pago
+        updated_paid = 0
+        updated_charged = 0
+        
+        # Marcar órdenes pagadas
+        for order_id, wallet_mov in pagos_map.items():
+            try:
+                result = db.execute(
+                    text("""
+                        UPDATE dropi_orders 
+                        SET is_paid = true, 
+                            paid_at = :paid_at, 
+                            paid_amount = :amount,
+                            wallet_transaction_id = :wallet_id,
+                            updated_at = :now
+                        WHERE user_id = :user_id AND dropi_order_id = :order_id AND is_paid = false
+                    """),
+                    {
+                        "paid_at": wallet_mov.movement_created_at,
+                        "amount": wallet_mov.amount,
+                        "wallet_id": wallet_mov.dropi_wallet_id,
+                        "now": datetime.utcnow(),
+                        "user_id": user_id,
+                        "order_id": order_id
+                    }
+                )
+                updated_paid += result.rowcount
+            except Exception as e:
+                db.rollback()
+                continue
+        
+        db.commit()
+        
+        # Marcar órdenes con devolución cobrada
+        for order_id, wallet_mov in cobros_map.items():
+            try:
+                result = db.execute(
+                    text("""
+                        UPDATE dropi_orders 
+                        SET is_return_charged = true, 
+                            return_charged_at = :charged_at, 
+                            return_charged_amount = :amount,
+                            updated_at = :now
+                        WHERE user_id = :user_id AND dropi_order_id = :order_id AND is_return_charged = false
+                    """),
+                    {
+                        "charged_at": wallet_mov.movement_created_at,
+                        "amount": wallet_mov.amount,
+                        "now": datetime.utcnow(),
+                        "user_id": user_id,
+                        "order_id": order_id
+                    }
+                )
+                updated_charged += result.rowcount
+            except Exception as e:
+                db.rollback()
+                continue
+        
+        db.commit()
+        
+        print(f"[DROPI SYNC] Reconciliation completed: {updated_paid} paid, {updated_charged} charged")
+        return {"success": True, "updated_paid": updated_paid, "updated_charged": updated_charged}
+        
+    except Exception as e:
+        print(f"[DROPI SYNC] Reconciliation error: {e}")
+        db.rollback()
+        return {"success": False, "error": str(e)}
 
 
 async def sync_dropi_full(user_id: int, db: Session = None) -> dict:
@@ -563,6 +602,8 @@ async def sync_dropi_full(user_id: int, db: Session = None) -> dict:
     if db is None:
         db = SessionLocal()
         close_db = True
+    
+    connection = None
     
     try:
         # 1. Obtener conexión del usuario
@@ -638,8 +679,11 @@ async def sync_dropi_full(user_id: int, db: Session = None) -> dict:
     except Exception as e:
         print(f"[DROPI SYNC] Error: {e}")
         if connection:
-            connection.sync_status = "error"
-            db.commit()
+            try:
+                connection.sync_status = "error"
+                db.commit()
+            except:
+                db.rollback()
         return {"success": False, "error": str(e)}
     
     finally:
@@ -679,7 +723,14 @@ async def sync_all_dropi_users():
             user = db.query(User).filter(User.id == conn.user_id).first()
             if user:
                 print(f"[DROPI CRON] Syncing user {user.email}...")
-                result = await sync_dropi_full(conn.user_id, db)
+                
+                # Crear nueva sesión para cada usuario para evitar problemas de transacción
+                user_db = SessionLocal()
+                try:
+                    result = await sync_dropi_full(conn.user_id, user_db)
+                finally:
+                    user_db.close()
+                
                 results.append({
                     "user_id": conn.user_id,
                     "email": user.email,
