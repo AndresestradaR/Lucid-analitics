@@ -432,6 +432,7 @@ async def get_wallet_history(
     
     # Hacer login fresco para obtener token válido
     token = None
+    user_id = None
     try:
         email = decrypt_token(connection.email_encrypted)
         password = decrypt_token(connection.password_encrypted)
@@ -439,13 +440,20 @@ async def get_wallet_history(
         login_result = await dropi_login(email, password, connection.country)
         if login_result.get("success"):
             token = login_result.get("token")
+            user_id = login_result.get("user_id")  # Guardar user_id del primer login
             print(f"[WALLET HISTORY] Got token: {token[:20] if token else 'None'}...")
             # Actualizar token en BD
             connection.current_token = token
             connection.token_expires_at = datetime.utcnow() + timedelta(hours=24)
             db.commit()
         else:
-            print(f"[WALLET HISTORY] Login failed: {login_result.get('error')}")
+            error_msg = login_result.get('error', '')
+            print(f"[WALLET HISTORY] Login failed: {error_msg}")
+            # Si credenciales incorrectas, desactivar conexión
+            if "incorrecta" in error_msg.lower() or "denied" in error_msg.lower() or "bloqueo" in error_msg.lower():
+                connection.is_active = False
+                connection.current_token = None
+                db.commit()
     except Exception as e:
         print(f"[WALLET HISTORY] Login exception: {e}")
     
@@ -464,16 +472,6 @@ async def get_wallet_history(
     except:
         end_dt = datetime.now()
         start_dt = end_dt - timedelta(days=days)
-    
-    # Obtener user_id del login
-    login_data = await dropi_login(
-        decrypt_token(connection.email_encrypted),
-        decrypt_token(connection.password_encrypted),
-        connection.country
-    )
-    user_id = None
-    if login_data.get("success"):
-        user_id = login_data.get("user_id")
     
     print(f"[WALLET HISTORY] User ID: {user_id}")
     
@@ -1071,6 +1069,8 @@ async def get_dropi_summary(
     wallet_balance = 0
     token = None
     user_id = None
+    login_failed = False
+    login_error_msg = None
     
     try:
         email = decrypt_token(connection.email_encrypted)
@@ -1089,14 +1089,28 @@ async def get_dropi_summary(
             connection.current_token = token
             connection.token_expires_at = datetime.utcnow() + timedelta(hours=24)
             db.commit()
+        else:
+            login_failed = True
+            login_error_msg = login_result.get("error", "Login failed")
+            print(f"[DROPI DEBUG] Login FAILED: {login_error_msg}")
+            
+            # Si las credenciales son incorrectas, desactivar conexión y retornar INMEDIATAMENTE
+            if "incorrecta" in login_error_msg.lower() or "denied" in login_error_msg.lower() or "bloqueo" in login_error_msg.lower():
+                connection.is_active = False
+                connection.current_token = None
+                db.commit()
+                return {
+                    "connected": False,
+                    "error": f"Credenciales de Dropi inválidas. Reconecta tu cuenta.",
+                    "needs_reconnect": True
+                }
     except Exception as e:
         print(f"[DROPI DEBUG] Error getting wallet from login: {e}")
+        login_failed = True
+        login_error_msg = str(e)
     
-    # Si no tenemos token del login fresco, intentar con ensure_dropi_token
-    if not token:
-        token = await ensure_dropi_token(connection, db)
-    
-    if not token:
+    # Si el login falló, NO intentar ensure_dropi_token (solo causa más demora)
+    if not token and login_failed:
         return {
             "connected": True,
             "error": "Token expirado, reconecta tu cuenta",
