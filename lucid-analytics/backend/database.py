@@ -1,9 +1,10 @@
 """
 Database models y configuración
 Lucid Analytics - Meta Ads + LucidBot + Dropi
+CON CACHE LOCAL PARA DROPI
 """
 
-from sqlalchemy import create_engine, Column, Integer, BigInteger, String, DateTime, Float, Boolean, ForeignKey, Text
+from sqlalchemy import create_engine, Column, Integer, BigInteger, String, DateTime, Float, Boolean, ForeignKey, Text, Numeric, Index
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
@@ -125,6 +126,11 @@ class DropiConnection(Base):
     dropi_user_id = Column(String(100), nullable=True)
     dropi_user_name = Column(String(255), nullable=True)
     
+    # Control de sincronización
+    last_orders_sync = Column(DateTime, nullable=True)
+    last_wallet_sync = Column(DateTime, nullable=True)
+    sync_status = Column(String(50), default="pending")  # pending, syncing, completed, error
+    
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -242,6 +248,116 @@ class LucidbotContact(Base):
     # Control de sincronización
     synced_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ==================== NUEVAS TABLAS PARA CACHE DE DROPI ====================
+
+class DropiOrder(Base):
+    """
+    Pedidos de Dropi sincronizados localmente.
+    Permite consultas instantáneas sin llamar a la API.
+    """
+    __tablename__ = "dropi_orders"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    
+    # ID único de Dropi
+    dropi_order_id = Column(BigInteger, nullable=False, index=True)
+    
+    # Estado del pedido (ENTREGADO, DEVOLUCION, CANCELADO, etc.)
+    status = Column(String(100), index=True)
+    status_raw = Column(String(100))  # Estado original sin normalizar
+    
+    # Datos financieros
+    total_order = Column(Numeric(12, 2), default=0)
+    shipping_amount = Column(Numeric(12, 2), default=0)
+    dropshipper_profit = Column(Numeric(12, 2), default=0)  # Lo que ganas
+    
+    # Datos del cliente
+    customer_name = Column(String(255))
+    customer_phone = Column(String(50))
+    customer_city = Column(String(100))
+    customer_state = Column(String(100))
+    customer_address = Column(Text)
+    
+    # Datos de envío
+    shipping_guide = Column(String(100))
+    shipping_company = Column(String(100))
+    rate_type = Column(String(50))  # CON RECAUDO, SIN RECAUDO, etc.
+    
+    # Productos (JSON serializado)
+    products_json = Column(Text)
+    
+    # Fechas importantes de Dropi
+    order_created_at = Column(DateTime, nullable=False, index=True)  # Fecha creación pedido
+    order_updated_at = Column(DateTime)  # Última actualización en Dropi
+    delivered_at = Column(DateTime)  # Fecha de entrega
+    returned_at = Column(DateTime)  # Fecha de devolución
+    
+    # Cruce con wallet (para reconciliación)
+    is_paid = Column(Boolean, default=False)  # ¿Ya te pagaron?
+    paid_at = Column(DateTime)
+    paid_amount = Column(Numeric(12, 2))
+    wallet_transaction_id = Column(BigInteger)
+    
+    is_return_charged = Column(Boolean, default=False)  # ¿Ya te cobraron la devolución?
+    return_charged_at = Column(DateTime)
+    return_charged_amount = Column(Numeric(12, 2))
+    
+    # Metadatos de sincronización
+    synced_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    raw_data = Column(Text)  # JSON completo de Dropi para debug
+    
+    # Índice compuesto único
+    __table_args__ = (
+        Index('idx_dropi_orders_user_dropi_id', 'user_id', 'dropi_order_id', unique=True),
+        Index('idx_dropi_orders_user_created', 'user_id', 'order_created_at'),
+        Index('idx_dropi_orders_user_status', 'user_id', 'status'),
+    )
+
+
+class DropiWalletHistory(Base):
+    """
+    Historial de wallet de Dropi sincronizado localmente.
+    Permite cruce de datos para reconciliación.
+    """
+    __tablename__ = "dropi_wallet_history"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    
+    # ID único del movimiento en Dropi
+    dropi_wallet_id = Column(BigInteger, nullable=False, index=True)
+    
+    # Tipo de movimiento
+    movement_type = Column(String(50))  # ENTRADA, SALIDA
+    description = Column(Text)
+    
+    # Montos
+    amount = Column(Numeric(12, 2), default=0)
+    balance_after = Column(Numeric(12, 2), default=0)  # Saldo después del movimiento
+    
+    # Referencia a orden (si aplica)
+    order_id = Column(BigInteger, index=True)
+    
+    # Categorización (calculada)
+    category = Column(String(50))  # ganancia_dropshipping, cobro_flete, retiro, recarga, otro
+    
+    # Fecha del movimiento
+    movement_created_at = Column(DateTime, nullable=False, index=True)
+    
+    # Metadatos de sincronización
+    synced_at = Column(DateTime, default=datetime.utcnow)
+    raw_data = Column(Text)
+    
+    # Índice compuesto único
+    __table_args__ = (
+        Index('idx_dropi_wallet_user_dropi_id', 'user_id', 'dropi_wallet_id', unique=True),
+        Index('idx_dropi_wallet_user_created', 'user_id', 'movement_created_at'),
+        Index('idx_dropi_wallet_order', 'user_id', 'order_id'),
+    )
 
 
 # ========== FUNCIONES ==========
