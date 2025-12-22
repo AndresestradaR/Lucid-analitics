@@ -72,7 +72,13 @@ def get_dropi_headers(token: str = None, country: str = "co"):
         "Accept": "application/json, text/plain, */*",
         "Origin": origin,
         "Referer": f"{origin}/",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site",
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -93,6 +99,11 @@ async def dropi_login(email: str, password: str, country: str) -> dict:
         "with_cdc": False
     }
     
+    # Log para debug
+    email_censored = email[:3] + "***" if email else "none"
+    print(f"[DROPI LOGIN] Attempting login for {email_censored} in {country}")
+    print(f"[DROPI LOGIN] URL: {api_url}/api/login")
+    
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             response = await client.post(
@@ -100,7 +111,21 @@ async def dropi_login(email: str, password: str, country: str) -> dict:
                 json=payload,
                 headers=get_dropi_headers(country=country)
             )
-            data = response.json()
+            
+            # Log response details
+            print(f"[DROPI LOGIN] Response status: {response.status_code}")
+            
+            try:
+                data = response.json()
+                # Solo mostrar parte de la respuesta para no exponer tokens
+                safe_data = {k: v for k, v in data.items() if k not in ['token']}
+                if 'token' in data:
+                    safe_data['token'] = '***exists***'
+                print(f"[DROPI LOGIN] Response: {safe_data}")
+            except Exception as json_err:
+                print(f"[DROPI LOGIN] Failed to parse JSON: {json_err}")
+                print(f"[DROPI LOGIN] Raw response: {response.text[:500]}")
+                return {"success": False, "error": f"Invalid JSON response: {response.text[:200]}"}
             
             if data.get("isSuccess") and data.get("token"):
                 user_data = data.get("objects", {})
@@ -116,6 +141,7 @@ async def dropi_login(email: str, password: str, country: str) -> dict:
                     except:
                         pass
                 
+                print(f"[DROPI LOGIN] Success! User ID: {user_data.get('id')}")
                 return {
                     "success": True,
                     "token": data["token"],
@@ -123,8 +149,12 @@ async def dropi_login(email: str, password: str, country: str) -> dict:
                     "user_name": f"{user_data.get('name', '')} {user_data.get('surname', '')}".strip(),
                     "wallet_balance": wallet_balance
                 }
-            return {"success": False, "error": data.get("message", "Login failed")}
+            
+            error_msg = data.get("message", "Login failed")
+            print(f"[DROPI LOGIN] Failed: {error_msg}")
+            return {"success": False, "error": error_msg}
         except Exception as e:
+            print(f"[DROPI LOGIN] Exception: {str(e)}")
             return {"success": False, "error": str(e)}
 
 
