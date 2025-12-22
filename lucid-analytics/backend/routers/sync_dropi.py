@@ -2,6 +2,8 @@
 Sincronización de Dropi - Orders y Wallet History
 Similar a sync.py de LucidBot pero para Dropi
 
+OPTIMIZADO: No guarda raw_data para reducir uso de disco ~80%
+
 Flujo:
 1. sync_dropi_orders() - Sincroniza todos los pedidos
 2. sync_dropi_wallet() - Sincroniza historial de wallet
@@ -262,6 +264,8 @@ async def sync_dropi_orders_for_user(
     
     - full_sync=True: Trae TODO el histórico (primera vez)
     - full_sync=False: Solo órdenes actualizadas en los últimos 7 días
+    
+    OPTIMIZADO: No guarda raw_data para ahorrar ~80% de espacio
     """
     print(f"[DROPI SYNC] Starting orders sync for user {user_id}, full_sync={full_sync}")
     
@@ -324,38 +328,38 @@ async def sync_dropi_orders_for_user(
                 status_raw = str(status_raw).strip()
                 status_normalized = normalize_status(status_raw)
                 
-                # Extraer productos
+                # Extraer productos - solo nombre, cantidad y precio (compacto)
                 products = []
                 for detail in order.get("orderdetails", []):
                     product = detail.get("product", {})
                     products.append({
-                        "name": product.get("name", "Producto"),
-                        "quantity": detail.get("quantity", 1),
-                        "price": float(detail.get("price", 0))
+                        "n": product.get("name", "Producto")[:100],  # Limitar nombre
+                        "q": detail.get("quantity", 1),
+                        "p": float(detail.get("price", 0))
                     })
                 
-                # Preparar datos para UPSERT
+                # Preparar datos para UPSERT - SIN raw_data para ahorrar espacio
                 order_data = {
                     "user_id": user_id,
                     "dropi_order_id": dropi_order_id,
                     "status": status_normalized,
-                    "status_raw": status_raw,
+                    "status_raw": status_raw[:100] if status_raw else None,  # Limitar
                     "total_order": float(order.get("total_order", 0)),
                     "shipping_amount": float(order.get("shipping_amount", 0)),
                     "dropshipper_profit": float(order.get("dropshipper_amount_to_win", 0)),
-                    "customer_name": f"{order.get('name', '')} {order.get('surname', '')}".strip(),
-                    "customer_phone": order.get("phone"),
-                    "customer_city": order.get("city"),
-                    "customer_state": order.get("state"),
-                    "customer_address": order.get("dir"),
-                    "shipping_guide": order.get("shipping_guide"),
-                    "shipping_company": order.get("shipping_company"),
-                    "rate_type": order.get("rate_type"),
+                    "customer_name": f"{order.get('name', '')} {order.get('surname', '')}"[:255].strip(),
+                    "customer_phone": str(order.get("phone", ""))[:50] if order.get("phone") else None,
+                    "customer_city": str(order.get("city", ""))[:100] if order.get("city") else None,
+                    "customer_state": str(order.get("state", ""))[:100] if order.get("state") else None,
+                    "customer_address": str(order.get("dir", ""))[:500] if order.get("dir") else None,  # Limitar
+                    "shipping_guide": str(order.get("shipping_guide", ""))[:100] if order.get("shipping_guide") else None,
+                    "shipping_company": str(order.get("shipping_company", ""))[:100] if order.get("shipping_company") else None,
+                    "rate_type": str(order.get("rate_type", ""))[:50] if order.get("rate_type") else None,
                     "products_json": json.dumps(products) if products else None,
                     "order_created_at": order_created,
                     "order_updated_at": order_updated,
                     "synced_at": datetime.utcnow(),
-                    "raw_data": json.dumps(order)
+                    # NO incluimos raw_data - ahorra ~5-10KB por orden
                 }
                 
                 # UPSERT usando PostgreSQL ON CONFLICT
@@ -373,7 +377,6 @@ async def sync_dropi_orders_for_user(
                         "shipping_guide": stmt.excluded.shipping_guide,
                         "order_updated_at": stmt.excluded.order_updated_at,
                         "synced_at": stmt.excluded.synced_at,
-                        "raw_data": stmt.excluded.raw_data,
                         "updated_at": datetime.utcnow()
                     }
                 )
@@ -418,6 +421,7 @@ async def sync_dropi_wallet_for_user(
 ) -> dict:
     """
     Sincronizar historial de wallet de Dropi para un usuario.
+    OPTIMIZADO: No guarda raw_data
     """
     print(f"[DROPI SYNC] Starting wallet sync for user {user_id}")
     
@@ -464,18 +468,19 @@ async def sync_dropi_wallet_for_user(
                 movement_type = mov.get("type", "")
                 description = mov.get("description", "")
                 
+                # SIN raw_data para ahorrar espacio
                 wallet_data = {
                     "user_id": user_id,
                     "dropi_wallet_id": dropi_wallet_id,
-                    "movement_type": movement_type,
-                    "description": description,
+                    "movement_type": str(movement_type)[:50] if movement_type else None,
+                    "description": str(description)[:500] if description else None,  # Limitar descripción
                     "amount": abs(float(mov.get("amount", 0))),
                     "balance_after": float(mov.get("previous_amount", 0)),  # Balance después
                     "order_id": mov.get("order_id"),
                     "category": categorize_wallet_movement(description, movement_type),
                     "movement_created_at": movement_created,
                     "synced_at": datetime.utcnow(),
-                    "raw_data": json.dumps(mov)
+                    # NO incluimos raw_data
                 }
                 
                 # UPSERT
