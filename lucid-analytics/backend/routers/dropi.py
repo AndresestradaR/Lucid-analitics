@@ -2,7 +2,7 @@
 Router de Dropi - LEE DE CACHE LOCAL (PostgreSQL)
 Los datos se sincronizan en background, las consultas son INSTANTÁNEAS.
 
-v2.7: Wallet cache - siempre muestra un valor (nunca $0 por error)
+v2.8: Wallet directo - consulta endpoint /api/wallet si login devuelve 0
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
@@ -118,7 +118,7 @@ async def dropi_login(email: str, password: str, country: str) -> dict:
                 if data.get("isSuccess") and data.get("token"):
                     user_data = data.get("objects", {})
                     
-                    # Extraer wallet
+                    # Extraer wallet del login (puede venir en varios formatos)
                     wallet_balance = 0
                     wallet_obj = user_data.get("wallet")
                     if isinstance(wallet_obj, dict):
@@ -143,6 +143,79 @@ async def dropi_login(email: str, password: str, country: str) -> dict:
         return {"success": False, "error": "Dropi no responde (timeout 15s)"}
     except Exception as e:
         return {"success": False, "error": str(e)[:100]}
+
+
+async def fetch_wallet_balance_direct(token: str, country: str) -> float:
+    """
+    Obtener el balance del wallet directamente del endpoint de wallet.
+    Esto es más confiable que extraerlo del login.
+    """
+    api_url = DROPI_API_URLS.get(country, DROPI_API_URLS["co"])
+    
+    try:
+        async with asyncio.timeout(10):
+            async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=3.0)) as client:
+                # Intentar endpoint principal de wallet
+                response = await client.get(
+                    f"{api_url}/api/wallet",
+                    headers=get_dropi_headers(token, country)
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get("isSuccess"):
+                        obj = data.get("objects", {})
+                        if isinstance(obj, dict):
+                            return float(obj.get("amount", 0) or 0)
+                        elif isinstance(obj, list) and len(obj) > 0:
+                            # Puede ser una lista de wallets
+                            first = obj[0]
+                            if isinstance(first, dict):
+                                return float(first.get("amount", 0) or 0)
+                        elif isinstance(obj, (int, float)):
+                            return float(obj)
+                
+                # Intentar endpoint alternativo /api/user/wallet
+                response2 = await client.get(
+                    f"{api_url}/api/user/wallet",
+                    headers=get_dropi_headers(token, country)
+                )
+                
+                if response2.status_code == 200:
+                    data2 = response2.json()
+                    if data2.get("isSuccess"):
+                        obj = data2.get("objects", {})
+                        if isinstance(obj, dict):
+                            return float(obj.get("amount", 0) or 0)
+                
+                return 0
+    except Exception as e:
+        print(f"[WALLET DIRECT] Error: {e}")
+        return 0
+
+
+async def get_wallet_with_fallback(email: str, password: str, country: str) -> dict:
+    """
+    Obtener wallet con múltiples intentos:
+    1. Login y extraer wallet
+    2. Si wallet=0, llamar endpoint directo /api/wallet
+    3. Si todo falla, devolver error para usar cache
+    """
+    # Paso 1: Login
+    login_result = await dropi_login(email, password, country)
+    
+    if not login_result.get("success"):
+        return login_result  # Error de login
+    
+    token = login_result["token"]
+    wallet_balance = login_result.get("wallet_balance", 0)
+    
+    # Paso 2: Si wallet es 0, intentar endpoint directo
+    if wallet_balance == 0:
+        wallet_balance = await fetch_wallet_balance_direct(token, country)
+    
+    login_result["wallet_balance"] = wallet_balance
+    return login_result
 
 
 def update_cached_wallet(connection: DropiConnection, balance: float, db: Session):
@@ -186,7 +259,8 @@ async def connect_dropi(
             detail=f"País no soportado. Opciones: {', '.join(DROPI_API_URLS.keys())}"
         )
     
-    result = await dropi_login(data.email, data.password, data.country)
+    # Usar función con fallback para obtener wallet
+    result = await get_wallet_with_fallback(data.email, data.password, data.country)
     
     if not result.get("success"):
         raise HTTPException(
@@ -339,11 +413,11 @@ async def get_wallet(
     if not connection:
         raise HTTPException(status_code=404, detail="No hay conexión de Dropi")
     
-    # Intentar login fresco para balance actual
+    # Intentar obtener wallet con fallback
     email = decrypt_token(connection.email_encrypted)
     password = decrypt_token(connection.password_encrypted)
     
-    result = await dropi_login(email, password, connection.country)
+    result = await get_wallet_with_fallback(email, password, connection.country)
     
     wallet_live = False
     wallet_error = None
@@ -681,7 +755,7 @@ async def get_dropi_summary(
         except:
             item["display_date"] = item["date"]
     
-    # ========== WALLET EN TIEMPO REAL CON FALLBACK A CACHE ==========
+    # ========== WALLET EN TIEMPO REAL CON FALLBACK ==========
     wallet_balance = 0
     wallet_live = False
     wallet_error = None
@@ -690,7 +764,9 @@ async def get_dropi_summary(
     try:
         email = decrypt_token(connection.email_encrypted)
         password = decrypt_token(connection.password_encrypted)
-        login_result = await dropi_login(email, password, connection.country)
+        
+        # Usar función con fallback que intenta endpoint directo si login devuelve 0
+        login_result = await get_wallet_with_fallback(email, password, connection.country)
         
         if login_result.get("success"):
             wallet_balance = login_result.get("wallet_balance", 0)
@@ -859,7 +935,7 @@ async def get_order_detail(
 @router.post("/test-login")
 async def test_dropi_login(data: DropiConnectRequest):
     """Test de login sin guardar nada - para debug"""
-    result = await dropi_login(data.email, data.password, data.country)
+    result = await get_wallet_with_fallback(data.email, data.password, data.country)
     
     if result.get("success"):
         return {
