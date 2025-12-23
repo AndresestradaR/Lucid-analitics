@@ -2,12 +2,13 @@
 Router de Dropi - LEE DE CACHE LOCAL (PostgreSQL)
 Los datos se sincronizan en background, las consultas son INSTANTÁNEAS.
 
-v2.8: Wallet directo - consulta endpoint /api/wallet si login devuelve 0
+v2.9: Wallet desde historial - Dropi ya no devuelve wallet en login ni en /api/wallet
+      El saldo se calcula del último movimiento del historial sincronizado
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, desc
 from typing import Optional
 from datetime import datetime, timedelta
 from pydantic import BaseModel
@@ -118,23 +119,11 @@ async def dropi_login(email: str, password: str, country: str) -> dict:
                 if data.get("isSuccess") and data.get("token"):
                     user_data = data.get("objects", {})
                     
-                    # Extraer wallet del login (puede venir en varios formatos)
-                    wallet_balance = 0
-                    wallet_obj = user_data.get("wallet")
-                    if isinstance(wallet_obj, dict):
-                        wallet_balance = float(wallet_obj.get("amount", 0) or 0)
-                    elif wallet_obj is not None:
-                        try:
-                            wallet_balance = float(wallet_obj)
-                        except:
-                            pass
-                    
                     return {
                         "success": True,
                         "token": data["token"],
                         "user_id": str(user_data.get("id", "")),
                         "user_name": f"{user_data.get('name', '')} {user_data.get('surname', '')}".strip(),
-                        "wallet_balance": wallet_balance
                     }
                 else:
                     return {"success": False, "error": data.get("message", "Login failed")}
@@ -145,83 +134,28 @@ async def dropi_login(email: str, password: str, country: str) -> dict:
         return {"success": False, "error": str(e)[:100]}
 
 
-async def fetch_wallet_balance_direct(token: str, country: str) -> float:
+def get_wallet_from_history(user_id: int, db: Session) -> float:
     """
-    Obtener el balance del wallet directamente del endpoint de wallet.
-    Esto es más confiable que extraerlo del login.
+    Obtener el saldo actual del wallet desde el historial sincronizado.
+    El campo balance_after del último movimiento ES el saldo actual.
+    
+    NOTA: Dropi ya no devuelve el wallet en login ni en /api/wallet,
+    pero el historial SÍ tiene el balance después de cada movimiento.
     """
-    api_url = DROPI_API_URLS.get(country, DROPI_API_URLS["co"])
+    # Obtener el último movimiento de wallet (el más reciente)
+    last_movement = db.query(DropiWalletHistory).filter(
+        DropiWalletHistory.user_id == user_id
+    ).order_by(desc(DropiWalletHistory.movement_created_at)).first()
     
-    try:
-        async with asyncio.timeout(10):
-            async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=3.0)) as client:
-                # Intentar endpoint principal de wallet
-                response = await client.get(
-                    f"{api_url}/api/wallet",
-                    headers=get_dropi_headers(token, country)
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    if data.get("isSuccess"):
-                        obj = data.get("objects", {})
-                        if isinstance(obj, dict):
-                            return float(obj.get("amount", 0) or 0)
-                        elif isinstance(obj, list) and len(obj) > 0:
-                            # Puede ser una lista de wallets
-                            first = obj[0]
-                            if isinstance(first, dict):
-                                return float(first.get("amount", 0) or 0)
-                        elif isinstance(obj, (int, float)):
-                            return float(obj)
-                
-                # Intentar endpoint alternativo /api/user/wallet
-                response2 = await client.get(
-                    f"{api_url}/api/user/wallet",
-                    headers=get_dropi_headers(token, country)
-                )
-                
-                if response2.status_code == 200:
-                    data2 = response2.json()
-                    if data2.get("isSuccess"):
-                        obj = data2.get("objects", {})
-                        if isinstance(obj, dict):
-                            return float(obj.get("amount", 0) or 0)
-                
-                return 0
-    except Exception as e:
-        print(f"[WALLET DIRECT] Error: {e}")
-        return 0
-
-
-async def get_wallet_with_fallback(email: str, password: str, country: str) -> dict:
-    """
-    Obtener wallet con múltiples intentos:
-    1. Login y extraer wallet
-    2. Si wallet=0, llamar endpoint directo /api/wallet
-    3. Si todo falla, devolver error para usar cache
-    """
-    # Paso 1: Login
-    login_result = await dropi_login(email, password, country)
+    if last_movement and last_movement.balance_after is not None:
+        return float(last_movement.balance_after)
     
-    if not login_result.get("success"):
-        return login_result  # Error de login
-    
-    token = login_result["token"]
-    wallet_balance = login_result.get("wallet_balance", 0)
-    
-    # Paso 2: Si wallet es 0, intentar endpoint directo
-    if wallet_balance == 0:
-        wallet_balance = await fetch_wallet_balance_direct(token, country)
-    
-    login_result["wallet_balance"] = wallet_balance
-    return login_result
+    return 0
 
 
 def update_cached_wallet(connection: DropiConnection, balance: float, db: Session):
     """
     Actualizar el wallet cacheado en la conexión.
-    Se llama cada vez que hacemos login exitoso.
     """
     try:
         connection.cached_wallet_balance = balance
@@ -259,8 +193,7 @@ async def connect_dropi(
             detail=f"País no soportado. Opciones: {', '.join(DROPI_API_URLS.keys())}"
         )
     
-    # Usar función con fallback para obtener wallet
-    result = await get_wallet_with_fallback(data.email, data.password, data.country)
+    result = await dropi_login(data.email, data.password, data.country)
     
     if not result.get("success"):
         raise HTTPException(
@@ -272,8 +205,6 @@ async def connect_dropi(
         DropiConnection.user_id == current_user.id
     ).first()
     
-    wallet_balance = result.get("wallet_balance", 0)
-    
     if existing:
         existing.email_encrypted = encrypt_token(data.email)
         existing.password_encrypted = encrypt_token(data.password)
@@ -282,8 +213,6 @@ async def connect_dropi(
         existing.token_expires_at = datetime.utcnow() + timedelta(hours=24)
         existing.dropi_user_id = result.get("user_id")
         existing.dropi_user_name = result.get("user_name")
-        existing.cached_wallet_balance = wallet_balance
-        existing.cached_wallet_updated_at = datetime.utcnow()
         existing.is_active = True
         existing.sync_status = "pending"
         existing.updated_at = datetime.utcnow()
@@ -300,8 +229,6 @@ async def connect_dropi(
             token_expires_at=datetime.utcnow() + timedelta(hours=24),
             dropi_user_id=result.get("user_id"),
             dropi_user_name=result.get("user_name"),
-            cached_wallet_balance=wallet_balance,
-            cached_wallet_updated_at=datetime.utcnow(),
             sync_status="pending"
         )
         db.add(connection)
@@ -338,6 +265,9 @@ async def get_dropi_status(
         DropiWalletHistory.user_id == current_user.id
     ).scalar() or 0
     
+    # Wallet desde historial sincronizado
+    wallet_balance = get_wallet_from_history(current_user.id, db)
+    
     return {
         "connected": True,
         "country": connection.country,
@@ -348,7 +278,7 @@ async def get_dropi_status(
         "last_wallet_sync": connection.last_wallet_sync.isoformat() if connection.last_wallet_sync else None,
         "cached_orders": total_orders,
         "cached_wallet_movements": total_wallet,
-        "cached_wallet_balance": float(connection.cached_wallet_balance or 0),
+        "cached_wallet_balance": wallet_balance,
         "cached_wallet_updated_at": connection.cached_wallet_updated_at.isoformat() if connection.cached_wallet_updated_at else None,
         "created_at": connection.created_at.isoformat()
     }
@@ -404,7 +334,11 @@ async def get_wallet(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Obtener saldo actual de wallet (tiempo real con fallback a cache)"""
+    """
+    Obtener saldo actual de wallet.
+    Desde v2.9: Se obtiene del historial sincronizado porque Dropi
+    ya no devuelve el wallet en login ni en /api/wallet.
+    """
     connection = db.query(DropiConnection).filter(
         DropiConnection.user_id == current_user.id,
         DropiConnection.is_active == True
@@ -413,35 +347,25 @@ async def get_wallet(
     if not connection:
         raise HTTPException(status_code=404, detail="No hay conexión de Dropi")
     
-    # Intentar obtener wallet con fallback
-    email = decrypt_token(connection.email_encrypted)
-    password = decrypt_token(connection.password_encrypted)
+    # Obtener wallet desde el historial sincronizado
+    balance = get_wallet_from_history(current_user.id, db)
     
-    result = await get_wallet_with_fallback(email, password, connection.country)
+    # Obtener fecha del último movimiento
+    last_movement = db.query(DropiWalletHistory).filter(
+        DropiWalletHistory.user_id == current_user.id
+    ).order_by(desc(DropiWalletHistory.movement_created_at)).first()
     
-    wallet_live = False
-    wallet_error = None
-    balance = 0
-    
-    if result.get("success"):
-        balance = result.get("wallet_balance", 0)
-        wallet_live = True
-        # Actualizar cache y token
-        connection.current_token = result["token"]
-        connection.token_expires_at = datetime.utcnow() + timedelta(hours=24)
-        update_cached_wallet(connection, balance, db)
-    else:
-        # Fallback: usar cache
-        wallet_error = result.get("error", "Error desconocido")
-        balance, cached_at = get_cached_wallet(connection)
+    last_update = None
+    if last_movement:
+        last_update = last_movement.movement_created_at
     
     return {
         "balance": balance,
         "currency": "COP" if connection.country == "co" else "GTQ",
         "country": connection.country,
-        "live": wallet_live,
-        "error": wallet_error,
-        "cached_at": connection.cached_wallet_updated_at.isoformat() if connection.cached_wallet_updated_at else None
+        "source": "history",  # Indica que viene del historial
+        "last_movement_at": last_update.isoformat() if last_update else None,
+        "last_sync": connection.last_wallet_sync.isoformat() if connection.last_wallet_sync else None
     }
 
 
@@ -591,7 +515,9 @@ async def get_dropi_summary(
 ):
     """
     Resumen completo de Dropi desde CACHE LOCAL - INSTANTÁNEO!
-    Wallet se obtiene en tiempo real con fallback a cache.
+    
+    Desde v2.9: Wallet se obtiene del historial sincronizado porque
+    Dropi ya no devuelve el wallet en login ni en /api/wallet.
     """
     connection = db.query(DropiConnection).filter(
         DropiConnection.user_id == current_user.id,
@@ -755,43 +681,26 @@ async def get_dropi_summary(
         except:
             item["display_date"] = item["date"]
     
-    # ========== WALLET EN TIEMPO REAL CON FALLBACK ==========
-    wallet_balance = 0
-    wallet_live = False
-    wallet_error = None
-    wallet_cached_at = None
+    # ========== WALLET DESDE HISTORIAL SINCRONIZADO ==========
+    wallet_balance = get_wallet_from_history(current_user.id, db)
     
-    try:
-        email = decrypt_token(connection.email_encrypted)
-        password = decrypt_token(connection.password_encrypted)
-        
-        # Usar función con fallback que intenta endpoint directo si login devuelve 0
-        login_result = await get_wallet_with_fallback(email, password, connection.country)
-        
-        if login_result.get("success"):
-            wallet_balance = login_result.get("wallet_balance", 0)
-            wallet_live = True
-            # Actualizar cache y token
-            connection.current_token = login_result["token"]
-            connection.token_expires_at = datetime.utcnow() + timedelta(hours=24)
-            update_cached_wallet(connection, wallet_balance, db)
-        else:
-            # Login falló - usar cache
-            wallet_error = login_result.get("error", "Error de conexión")
-            wallet_balance, wallet_cached_at = get_cached_wallet(connection)
-    except Exception as e:
-        # Error inesperado - usar cache
-        wallet_error = str(e)[:100]
-        wallet_balance, wallet_cached_at = get_cached_wallet(connection)
+    # Obtener fecha del último movimiento
+    last_movement = db.query(DropiWalletHistory).filter(
+        DropiWalletHistory.user_id == current_user.id
+    ).order_by(desc(DropiWalletHistory.movement_created_at)).first()
+    
+    last_movement_at = None
+    if last_movement:
+        last_movement_at = last_movement.movement_created_at
     
     return {
         "connected": True,
         "wallet": {
             "balance": wallet_balance,
             "currency": "COP" if connection.country == "co" else "GTQ",
-            "live": wallet_live,
-            "error": wallet_error,
-            "cached_at": wallet_cached_at.isoformat() if wallet_cached_at else None
+            "source": "history",  # Indica que viene del historial
+            "last_movement_at": last_movement_at.isoformat() if last_movement_at else None,
+            "last_sync": connection.last_wallet_sync.isoformat() if connection.last_wallet_sync else None
         },
         "orders": stats,
         "period": {
@@ -935,15 +844,14 @@ async def get_order_detail(
 @router.post("/test-login")
 async def test_dropi_login(data: DropiConnectRequest):
     """Test de login sin guardar nada - para debug"""
-    result = await get_wallet_with_fallback(data.email, data.password, data.country)
+    result = await dropi_login(data.email, data.password, data.country)
     
     if result.get("success"):
         return {
             "success": True,
             "user_id": result.get("user_id"),
             "user_name": result.get("user_name"),
-            "wallet_balance": result.get("wallet_balance"),
-            "message": "Login exitoso"
+            "message": "Login exitoso (wallet se obtiene del historial sincronizado)"
         }
     else:
         return {
