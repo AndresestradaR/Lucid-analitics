@@ -2,13 +2,13 @@
 Router de Dropi - LEE DE CACHE LOCAL (PostgreSQL)
 Los datos se sincronizan en background, las consultas son INSTANTÁNEAS.
 
-v2.9: Wallet desde historial - Dropi ya no devuelve wallet en login ni en /api/wallet
-      El saldo se calcula del último movimiento del historial sincronizado
+v2.10: Wallet calculado - SUM(entradas) - SUM(salidas) del historial
+       Más preciso que balance_after que puede estar mal poblado
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.orm import Session
-from sqlalchemy import func, desc
+from sqlalchemy import func, desc, case
 from typing import Optional
 from datetime import datetime, timedelta
 from pydantic import BaseModel
@@ -136,44 +136,45 @@ async def dropi_login(email: str, password: str, country: str) -> dict:
 
 def get_wallet_from_history(user_id: int, db: Session) -> float:
     """
-    Obtener el saldo actual del wallet desde el historial sincronizado.
-    El campo balance_after del último movimiento ES el saldo actual.
+    Calcular el saldo actual del wallet sumando TODOS los movimientos.
+    
+    FÓRMULA: SUM(ENTRADAS) - SUM(SALIDAS)
     
     NOTA: Dropi ya no devuelve el wallet en login ni en /api/wallet,
-    pero el historial SÍ tiene el balance después de cada movimiento.
-    """
-    # Obtener el último movimiento de wallet (el más reciente)
-    last_movement = db.query(DropiWalletHistory).filter(
-        DropiWalletHistory.user_id == user_id
-    ).order_by(desc(DropiWalletHistory.movement_created_at)).first()
+    así que calculamos el balance sumando entradas y restando salidas.
     
-    if last_movement and last_movement.balance_after is not None:
-        return float(last_movement.balance_after)
+    Esto es más preciso que usar balance_after porque ese campo
+    puede no estar correctamente poblado por la API de Dropi.
+    """
+    # Calcular: SUM(entradas) - SUM(salidas)
+    result = db.query(
+        func.coalesce(
+            func.sum(
+                case(
+                    (DropiWalletHistory.movement_type == "ENTRADA", DropiWalletHistory.amount),
+                    else_=0
+                )
+            ), 0
+        ).label("total_in"),
+        func.coalesce(
+            func.sum(
+                case(
+                    (DropiWalletHistory.movement_type == "SALIDA", DropiWalletHistory.amount),
+                    else_=0
+                )
+            ), 0
+        ).label("total_out")
+    ).filter(
+        DropiWalletHistory.user_id == user_id
+    ).first()
+    
+    if result:
+        total_in = float(result.total_in or 0)
+        total_out = float(result.total_out or 0)
+        balance = total_in - total_out
+        return balance
     
     return 0
-
-
-def update_cached_wallet(connection: DropiConnection, balance: float, db: Session):
-    """
-    Actualizar el wallet cacheado en la conexión.
-    """
-    try:
-        connection.cached_wallet_balance = balance
-        connection.cached_wallet_updated_at = datetime.utcnow()
-        db.commit()
-    except Exception as e:
-        print(f"[WALLET CACHE] Error updating cache: {e}")
-        db.rollback()
-
-
-def get_cached_wallet(connection: DropiConnection) -> tuple:
-    """
-    Obtener el wallet cacheado.
-    Returns: (balance, updated_at)
-    """
-    balance = float(connection.cached_wallet_balance or 0)
-    updated_at = connection.cached_wallet_updated_at
-    return balance, updated_at
 
 
 # ========== ENDPOINTS ==========
@@ -265,7 +266,7 @@ async def get_dropi_status(
         DropiWalletHistory.user_id == current_user.id
     ).scalar() or 0
     
-    # Wallet desde historial sincronizado
+    # Wallet calculado desde historial sincronizado
     wallet_balance = get_wallet_from_history(current_user.id, db)
     
     return {
@@ -279,7 +280,6 @@ async def get_dropi_status(
         "cached_orders": total_orders,
         "cached_wallet_movements": total_wallet,
         "cached_wallet_balance": wallet_balance,
-        "cached_wallet_updated_at": connection.cached_wallet_updated_at.isoformat() if connection.cached_wallet_updated_at else None,
         "created_at": connection.created_at.isoformat()
     }
 
@@ -336,8 +336,8 @@ async def get_wallet(
 ):
     """
     Obtener saldo actual de wallet.
-    Desde v2.9: Se obtiene del historial sincronizado porque Dropi
-    ya no devuelve el wallet en login ni en /api/wallet.
+    Desde v2.10: Se calcula sumando entradas y restando salidas
+    del historial sincronizado.
     """
     connection = db.query(DropiConnection).filter(
         DropiConnection.user_id == current_user.id,
@@ -347,13 +347,18 @@ async def get_wallet(
     if not connection:
         raise HTTPException(status_code=404, detail="No hay conexión de Dropi")
     
-    # Obtener wallet desde el historial sincronizado
+    # Calcular wallet desde el historial sincronizado
     balance = get_wallet_from_history(current_user.id, db)
     
     # Obtener fecha del último movimiento
     last_movement = db.query(DropiWalletHistory).filter(
         DropiWalletHistory.user_id == current_user.id
     ).order_by(desc(DropiWalletHistory.movement_created_at)).first()
+    
+    # Contar movimientos
+    total_movements = db.query(func.count(DropiWalletHistory.id)).filter(
+        DropiWalletHistory.user_id == current_user.id
+    ).scalar() or 0
     
     last_update = None
     if last_movement:
@@ -363,7 +368,8 @@ async def get_wallet(
         "balance": balance,
         "currency": "COP" if connection.country == "co" else "GTQ",
         "country": connection.country,
-        "source": "history",  # Indica que viene del historial
+        "source": "calculated",  # Indica que es SUM(in) - SUM(out)
+        "total_movements": total_movements,
         "last_movement_at": last_update.isoformat() if last_update else None,
         "last_sync": connection.last_wallet_sync.isoformat() if connection.last_wallet_sync else None
     }
@@ -516,8 +522,8 @@ async def get_dropi_summary(
     """
     Resumen completo de Dropi desde CACHE LOCAL - INSTANTÁNEO!
     
-    Desde v2.9: Wallet se obtiene del historial sincronizado porque
-    Dropi ya no devuelve el wallet en login ni en /api/wallet.
+    Desde v2.10: Wallet se calcula como SUM(entradas) - SUM(salidas)
+    del historial sincronizado. Más preciso que balance_after.
     """
     connection = db.query(DropiConnection).filter(
         DropiConnection.user_id == current_user.id,
@@ -681,7 +687,7 @@ async def get_dropi_summary(
         except:
             item["display_date"] = item["date"]
     
-    # ========== WALLET DESDE HISTORIAL SINCRONIZADO ==========
+    # ========== WALLET CALCULADO ==========
     wallet_balance = get_wallet_from_history(current_user.id, db)
     
     # Obtener fecha del último movimiento
@@ -698,7 +704,7 @@ async def get_dropi_summary(
         "wallet": {
             "balance": wallet_balance,
             "currency": "COP" if connection.country == "co" else "GTQ",
-            "source": "history",  # Indica que viene del historial
+            "source": "calculated",  # SUM(in) - SUM(out)
             "last_movement_at": last_movement_at.isoformat() if last_movement_at else None,
             "last_sync": connection.last_wallet_sync.isoformat() if connection.last_wallet_sync else None
         },
@@ -851,7 +857,7 @@ async def test_dropi_login(data: DropiConnectRequest):
             "success": True,
             "user_id": result.get("user_id"),
             "user_name": result.get("user_name"),
-            "message": "Login exitoso (wallet se obtiene del historial sincronizado)"
+            "message": "Login exitoso (wallet se calcula del historial sincronizado)"
         }
     else:
         return {
