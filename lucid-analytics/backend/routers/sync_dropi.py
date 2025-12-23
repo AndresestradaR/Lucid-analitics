@@ -122,16 +122,42 @@ async def dropi_login(email: str, password: str, country: str) -> dict:
                 if data.get("isSuccess") and data.get("token"):
                     user_data = data.get("objects", {})
                     
-                    # Extraer wallet balance
+                    # DEBUG: Log completo de la respuesta para ver estructura del wallet
+                    wallet_raw = user_data.get("wallet")
+                    print(f"[DROPI DEBUG] wallet raw type={type(wallet_raw).__name__}, value={wallet_raw}")
+                    
+                    # Extraer wallet balance - intentar múltiples formatos
                     wallet_balance = 0
-                    wallet_obj = user_data.get("wallet")
-                    if isinstance(wallet_obj, dict):
-                        wallet_balance = float(wallet_obj.get("amount", 0) or 0)
-                    elif wallet_obj is not None:
+                    
+                    if isinstance(wallet_raw, dict):
+                        # Formato: {"amount": 123.45, ...}
+                        wallet_balance = float(wallet_raw.get("amount", 0) or 0)
+                        print(f"[DROPI DEBUG] wallet from dict.amount = {wallet_balance}")
+                    elif isinstance(wallet_raw, (int, float)):
+                        # Formato: número directo
+                        wallet_balance = float(wallet_raw)
+                        print(f"[DROPI DEBUG] wallet from number = {wallet_balance}")
+                    elif isinstance(wallet_raw, str):
+                        # Formato: string "123.45"
                         try:
-                            wallet_balance = float(wallet_obj)
+                            wallet_balance = float(wallet_raw)
+                            print(f"[DROPI DEBUG] wallet from string = {wallet_balance}")
                         except:
                             pass
+                    
+                    # Si wallet sigue en 0, buscar en otros campos posibles
+                    if wallet_balance == 0:
+                        # Intentar otros campos comunes
+                        for field in ["balance", "saldo", "wallet_balance", "wallet_amount"]:
+                            val = user_data.get(field)
+                            if val is not None:
+                                try:
+                                    wallet_balance = float(val) if not isinstance(val, dict) else float(val.get("amount", 0))
+                                    if wallet_balance > 0:
+                                        print(f"[DROPI DEBUG] wallet from {field} = {wallet_balance}")
+                                        break
+                                except:
+                                    pass
                     
                     return {
                         "success": True,
@@ -239,6 +265,54 @@ async def fetch_dropi_wallet(token: str, country: str, user_id: str, page: int =
         return {"success": False, "error": "Timeout fetching wallet"}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+async def fetch_wallet_balance_direct(token: str, country: str) -> float:
+    """
+    Obtener el balance del wallet directamente del endpoint de wallet.
+    Esto es más confiable que extraerlo del login.
+    """
+    api_url = DROPI_API_URLS.get(country, DROPI_API_URLS["co"])
+    
+    try:
+        async with asyncio.timeout(15):
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+                # Intentar endpoint de wallet
+                response = await client.get(
+                    f"{api_url}/api/wallet",
+                    headers=get_dropi_headers(token, country)
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    print(f"[DROPI DEBUG] /api/wallet response: {data}")
+                    
+                    if data.get("isSuccess"):
+                        obj = data.get("objects", {})
+                        if isinstance(obj, dict):
+                            return float(obj.get("amount", 0) or 0)
+                        elif isinstance(obj, (int, float)):
+                            return float(obj)
+                
+                # Intentar endpoint alternativo
+                response2 = await client.get(
+                    f"{api_url}/api/user/wallet",
+                    headers=get_dropi_headers(token, country)
+                )
+                
+                if response2.status_code == 200:
+                    data2 = response2.json()
+                    print(f"[DROPI DEBUG] /api/user/wallet response: {data2}")
+                    
+                    if data2.get("isSuccess"):
+                        obj = data2.get("objects", {})
+                        if isinstance(obj, dict):
+                            return float(obj.get("amount", 0) or 0)
+                
+                return 0
+    except Exception as e:
+        print(f"[DROPI DEBUG] Error fetching wallet balance: {e}")
+        return 0
 
 
 def normalize_status(status_raw: str) -> str:
@@ -644,7 +718,7 @@ async def sync_dropi_full(user_id: int, db: Session = None) -> dict:
     Sincronización completa de Dropi para un usuario.
     Esta es la función principal que se llama desde el admin o cron.
     
-    AHORA GUARDA EL WALLET BALANCE EN CACHE.
+    AHORA OBTIENE WALLET BALANCE DIRECTAMENTE DEL ENDPOINT DE WALLET.
     """
     close_db = False
     if db is None:
@@ -682,6 +756,11 @@ async def sync_dropi_full(user_id: int, db: Session = None) -> dict:
         token = login_result["token"]
         dropi_user_id = login_result.get("user_id") or connection.dropi_user_id
         wallet_balance = login_result.get("wallet_balance", 0)
+        
+        # Si wallet del login es 0, intentar obtenerlo directamente
+        if wallet_balance == 0:
+            print(f"[DROPI SYNC] Wallet from login is 0, trying direct endpoint...")
+            wallet_balance = await fetch_wallet_balance_direct(token, connection.country)
         
         print(f"[DROPI SYNC] Login successful, dropi_user_id={dropi_user_id}, wallet=${wallet_balance}")
         
