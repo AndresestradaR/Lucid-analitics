@@ -4,6 +4,8 @@ Similar a sync.py de LucidBot pero para Dropi
 
 OPTIMIZADO: No guarda raw_data para reducir uso de disco ~80%
 
+v2.11: Fix wallet - buscar en "wallets" (array), no "wallet"
+
 Flujo:
 1. sync_dropi_orders() - Sincroniza todos los pedidos
 2. sync_dropi_wallet() - Sincroniza historial de wallet
@@ -95,7 +97,9 @@ def get_dropi_headers(token: str = None, country: str = "co"):
 async def dropi_login(email: str, password: str, country: str) -> dict:
     """
     Hacer login en Dropi y obtener token con timeout real.
-    AHORA TAMBIÉN EXTRAE EL WALLET BALANCE.
+    
+    v2.11: El wallet viene en "wallets" (array), no "wallet" (objeto)
+    Según documentación: wallets[0].amount
     """
     api_url = DROPI_API_URLS.get(country, DROPI_API_URLS["co"])
     white_brand_id = WHITE_BRAND_IDS.get(country, WHITE_BRAND_IDS["co"])
@@ -122,42 +126,59 @@ async def dropi_login(email: str, password: str, country: str) -> dict:
                 if data.get("isSuccess") and data.get("token"):
                     user_data = data.get("objects", {})
                     
-                    # DEBUG: Log completo de la respuesta para ver estructura del wallet
-                    wallet_raw = user_data.get("wallet")
-                    print(f"[DROPI DEBUG] wallet raw type={type(wallet_raw).__name__}, value={wallet_raw}")
-                    
-                    # Extraer wallet balance - intentar múltiples formatos
+                    # === EXTRAER WALLET - MÚLTIPLES FORMATOS ===
                     wallet_balance = 0
                     
-                    if isinstance(wallet_raw, dict):
-                        # Formato: {"amount": 123.45, ...}
-                        wallet_balance = float(wallet_raw.get("amount", 0) or 0)
-                        print(f"[DROPI DEBUG] wallet from dict.amount = {wallet_balance}")
-                    elif isinstance(wallet_raw, (int, float)):
-                        # Formato: número directo
-                        wallet_balance = float(wallet_raw)
-                        print(f"[DROPI DEBUG] wallet from number = {wallet_balance}")
-                    elif isinstance(wallet_raw, str):
-                        # Formato: string "123.45"
-                        try:
-                            wallet_balance = float(wallet_raw)
-                            print(f"[DROPI DEBUG] wallet from string = {wallet_balance}")
-                        except:
-                            pass
+                    # FORMATO 1: wallets (array) - según documentación oficial
+                    wallets_array = user_data.get("wallets") or data.get("wallets")
+                    if wallets_array and isinstance(wallets_array, list) and len(wallets_array) > 0:
+                        first_wallet = wallets_array[0]
+                        if isinstance(first_wallet, dict):
+                            amount = first_wallet.get("amount", 0)
+                            try:
+                                wallet_balance = float(str(amount).replace(",", ""))
+                                print(f"[DROPI DEBUG] wallet from wallets[0].amount = {wallet_balance}")
+                            except:
+                                pass
                     
-                    # Si wallet sigue en 0, buscar en otros campos posibles
+                    # FORMATO 2: wallet (objeto) - fallback
                     if wallet_balance == 0:
-                        # Intentar otros campos comunes
+                        wallet_obj = user_data.get("wallet")
+                        if isinstance(wallet_obj, dict):
+                            amount = wallet_obj.get("amount", 0)
+                            try:
+                                wallet_balance = float(str(amount).replace(",", ""))
+                                print(f"[DROPI DEBUG] wallet from wallet.amount = {wallet_balance}")
+                            except:
+                                pass
+                        elif isinstance(wallet_obj, (int, float)):
+                            wallet_balance = float(wallet_obj)
+                            print(f"[DROPI DEBUG] wallet from wallet (number) = {wallet_balance}")
+                        elif isinstance(wallet_obj, str):
+                            try:
+                                wallet_balance = float(wallet_obj.replace(",", ""))
+                                print(f"[DROPI DEBUG] wallet from wallet (string) = {wallet_balance}")
+                            except:
+                                pass
+                    
+                    # FORMATO 3: campos directos en user_data
+                    if wallet_balance == 0:
                         for field in ["balance", "saldo", "wallet_balance", "wallet_amount"]:
                             val = user_data.get(field)
                             if val is not None:
                                 try:
-                                    wallet_balance = float(val) if not isinstance(val, dict) else float(val.get("amount", 0))
+                                    wallet_balance = float(str(val).replace(",", ""))
                                     if wallet_balance > 0:
                                         print(f"[DROPI DEBUG] wallet from {field} = {wallet_balance}")
                                         break
                                 except:
                                     pass
+                    
+                    # DEBUG: Si aún es 0, mostrar keys disponibles
+                    if wallet_balance == 0:
+                        print(f"[DROPI DEBUG] wallet=0, available keys in objects: {list(user_data.keys())}")
+                        if "wallets" in user_data:
+                            print(f"[DROPI DEBUG] wallets content: {user_data.get('wallets')}")
                     
                     return {
                         "success": True,
@@ -217,6 +238,7 @@ async def fetch_dropi_orders(token: str, country: str, page: int = 0, limit: int
 async def fetch_dropi_wallet(token: str, country: str, user_id: str, page: int = 0, limit: int = 500, from_date: str = None) -> dict:
     """
     Obtener historial de wallet con paginación.
+    Endpoint: /api/historywallet
     """
     api_url = DROPI_API_URLS.get(country, DROPI_API_URLS["co"])
     
@@ -265,54 +287,6 @@ async def fetch_dropi_wallet(token: str, country: str, user_id: str, page: int =
         return {"success": False, "error": "Timeout fetching wallet"}
     except Exception as e:
         return {"success": False, "error": str(e)}
-
-
-async def fetch_wallet_balance_direct(token: str, country: str) -> float:
-    """
-    Obtener el balance del wallet directamente del endpoint de wallet.
-    Esto es más confiable que extraerlo del login.
-    """
-    api_url = DROPI_API_URLS.get(country, DROPI_API_URLS["co"])
-    
-    try:
-        async with asyncio.timeout(15):
-            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
-                # Intentar endpoint de wallet
-                response = await client.get(
-                    f"{api_url}/api/wallet",
-                    headers=get_dropi_headers(token, country)
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    print(f"[DROPI DEBUG] /api/wallet response: {data}")
-                    
-                    if data.get("isSuccess"):
-                        obj = data.get("objects", {})
-                        if isinstance(obj, dict):
-                            return float(obj.get("amount", 0) or 0)
-                        elif isinstance(obj, (int, float)):
-                            return float(obj)
-                
-                # Intentar endpoint alternativo
-                response2 = await client.get(
-                    f"{api_url}/api/user/wallet",
-                    headers=get_dropi_headers(token, country)
-                )
-                
-                if response2.status_code == 200:
-                    data2 = response2.json()
-                    print(f"[DROPI DEBUG] /api/user/wallet response: {data2}")
-                    
-                    if data2.get("isSuccess"):
-                        obj = data2.get("objects", {})
-                        if isinstance(obj, dict):
-                            return float(obj.get("amount", 0) or 0)
-                
-                return 0
-    except Exception as e:
-        print(f"[DROPI DEBUG] Error fetching wallet balance: {e}")
-        return 0
 
 
 def normalize_status(status_raw: str) -> str:
@@ -718,7 +692,7 @@ async def sync_dropi_full(user_id: int, db: Session = None) -> dict:
     Sincronización completa de Dropi para un usuario.
     Esta es la función principal que se llama desde el admin o cron.
     
-    AHORA OBTIENE WALLET BALANCE DIRECTAMENTE DEL ENDPOINT DE WALLET.
+    v2.11: Busca wallet en "wallets" (array) según documentación oficial
     """
     close_db = False
     if db is None:
@@ -757,18 +731,14 @@ async def sync_dropi_full(user_id: int, db: Session = None) -> dict:
         dropi_user_id = login_result.get("user_id") or connection.dropi_user_id
         wallet_balance = login_result.get("wallet_balance", 0)
         
-        # Si wallet del login es 0, intentar obtenerlo directamente
-        if wallet_balance == 0:
-            print(f"[DROPI SYNC] Wallet from login is 0, trying direct endpoint...")
-            wallet_balance = await fetch_wallet_balance_direct(token, connection.country)
-        
         print(f"[DROPI SYNC] Login successful, dropi_user_id={dropi_user_id}, wallet=${wallet_balance}")
         
         # Actualizar token Y wallet cache
         connection.current_token = token
         connection.token_expires_at = datetime.utcnow() + timedelta(hours=24)
-        connection.cached_wallet_balance = wallet_balance
-        connection.cached_wallet_updated_at = datetime.utcnow()
+        if wallet_balance > 0:
+            connection.cached_wallet_balance = wallet_balance
+            connection.cached_wallet_updated_at = datetime.utcnow()
         db.commit()
         
         # 4. Determinar si es full sync (primera vez) o incremental
