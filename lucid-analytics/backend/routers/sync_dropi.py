@@ -93,7 +93,10 @@ def get_dropi_headers(token: str = None, country: str = "co"):
 
 
 async def dropi_login(email: str, password: str, country: str) -> dict:
-    """Hacer login en Dropi y obtener token con timeout real"""
+    """
+    Hacer login en Dropi y obtener token con timeout real.
+    AHORA TAMBIÉN EXTRAE EL WALLET BALANCE.
+    """
     api_url = DROPI_API_URLS.get(country, DROPI_API_URLS["co"])
     white_brand_id = WHITE_BRAND_IDS.get(country, WHITE_BRAND_IDS["co"])
     
@@ -118,10 +121,23 @@ async def dropi_login(email: str, password: str, country: str) -> dict:
                 
                 if data.get("isSuccess") and data.get("token"):
                     user_data = data.get("objects", {})
+                    
+                    # Extraer wallet balance
+                    wallet_balance = 0
+                    wallet_obj = user_data.get("wallet")
+                    if isinstance(wallet_obj, dict):
+                        wallet_balance = float(wallet_obj.get("amount", 0) or 0)
+                    elif wallet_obj is not None:
+                        try:
+                            wallet_balance = float(wallet_obj)
+                        except:
+                            pass
+                    
                     return {
                         "success": True,
                         "token": data["token"],
                         "user_id": str(user_data.get("id", "")),
+                        "wallet_balance": wallet_balance,
                     }
                 return {"success": False, "error": data.get("message", "Login failed")}
     except asyncio.TimeoutError:
@@ -627,6 +643,8 @@ async def sync_dropi_full(user_id: int, db: Session = None) -> dict:
     """
     Sincronización completa de Dropi para un usuario.
     Esta es la función principal que se llama desde el admin o cron.
+    
+    AHORA GUARDA EL WALLET BALANCE EN CACHE.
     """
     close_db = False
     if db is None:
@@ -634,6 +652,7 @@ async def sync_dropi_full(user_id: int, db: Session = None) -> dict:
         close_db = True
     
     connection = None
+    wallet_balance = 0
     
     try:
         # 1. Obtener conexión del usuario
@@ -662,12 +681,15 @@ async def sync_dropi_full(user_id: int, db: Session = None) -> dict:
         
         token = login_result["token"]
         dropi_user_id = login_result.get("user_id") or connection.dropi_user_id
+        wallet_balance = login_result.get("wallet_balance", 0)
         
-        print(f"[DROPI SYNC] Login successful, dropi_user_id={dropi_user_id}")
+        print(f"[DROPI SYNC] Login successful, dropi_user_id={dropi_user_id}, wallet=${wallet_balance}")
         
-        # Actualizar token
+        # Actualizar token Y wallet cache
         connection.current_token = token
         connection.token_expires_at = datetime.utcnow() + timedelta(hours=24)
+        connection.cached_wallet_balance = wallet_balance
+        connection.cached_wallet_updated_at = datetime.utcnow()
         db.commit()
         
         # 4. Determinar si es full sync (primera vez) o incremental
@@ -705,6 +727,7 @@ async def sync_dropi_full(user_id: int, db: Session = None) -> dict:
             "success": True,
             "orders_synced": orders_result.get("synced", 0),
             "wallet_synced": wallet_result.get("synced", 0),
+            "wallet_balance": wallet_balance,
             "reconciled_paid": reconcile_result.get("updated_paid", 0),
             "reconciled_charged": reconcile_result.get("updated_charged", 0)
         }
