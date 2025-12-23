@@ -255,6 +255,27 @@ def run_migrations():
         """
         UPDATE dropi_wallet_history SET raw_data = NULL WHERE raw_data IS NOT NULL;
         """,
+        
+        # ==================== MIGRACIÓN 19: WALLET CACHE ====================
+        # Agregar columnas para cachear el wallet balance
+        """
+        DO $$ 
+        BEGIN 
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                           WHERE table_name='dropi_connections' AND column_name='cached_wallet_balance') THEN
+                ALTER TABLE dropi_connections ADD COLUMN cached_wallet_balance NUMERIC(12, 2) DEFAULT 0;
+            END IF;
+        END $$;
+        """,
+        """
+        DO $$ 
+        BEGIN 
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                           WHERE table_name='dropi_connections' AND column_name='cached_wallet_updated_at') THEN
+                ALTER TABLE dropi_connections ADD COLUMN cached_wallet_updated_at TIMESTAMP;
+            END IF;
+        END $$;
+        """,
         # VACUUM para recuperar espacio en disco (solo en PostgreSQL)
         # Nota: VACUUM no puede ejecutarse dentro de una transacción, así que lo hacemos por separado
     ]
@@ -365,7 +386,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Lucid Analytics API",
     description="Dashboard de métricas Meta Ads + LucidBot + Dropi para calcular CPA real",
-    version="2.6.0",
+    version="2.7.0",
     lifespan=lifespan
 )
 
@@ -393,8 +414,8 @@ async def root():
     return {
         "status": "ok",
         "service": "Lucid Analytics API",
-        "version": "2.6.0",
-        "features": ["Meta Ads", "LucidBot", "Dropi", "Chat IA", "Sync", "Admin", "Scheduler"],
+        "version": "2.7.0",
+        "features": ["Meta Ads", "LucidBot", "Dropi", "Chat IA", "Sync", "Admin", "Scheduler", "Wallet Cache"],
         "scheduler": "running" if scheduler.running else "stopped",
         "docs": "/docs"
     }

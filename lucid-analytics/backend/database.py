@@ -142,6 +142,10 @@ class DropiConnection(Base):
     dropi_user_id = Column(String(100), nullable=True)
     dropi_user_name = Column(String(255), nullable=True)
     
+    # Wallet cache - se actualiza en cada login exitoso
+    cached_wallet_balance = Column(Numeric(12, 2), default=0)
+    cached_wallet_updated_at = Column(DateTime, nullable=True)
+    
     # Control de sincronización
     last_orders_sync = Column(DateTime, nullable=True)
     last_wallet_sync = Column(DateTime, nullable=True)
