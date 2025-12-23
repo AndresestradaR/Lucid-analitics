@@ -143,6 +143,22 @@ async def dropi_login(email: str, password: str, country: str) -> dict:
         return {"success": False, "error": str(e)[:100]}
 
 
+def get_cached_wallet_balance(db: Session, user_id: int) -> float:
+    """
+    Obtener el último balance conocido desde el historial de wallet.
+    Útil como fallback cuando el login falla.
+    """
+    # Buscar el movimiento más reciente que tenga balance_after
+    last_movement = db.query(DropiWalletHistory).filter(
+        DropiWalletHistory.user_id == user_id
+    ).order_by(DropiWalletHistory.movement_created_at.desc()).first()
+    
+    if last_movement and last_movement.balance_after:
+        return float(last_movement.balance_after)
+    
+    return 0
+
+
 # ========== ENDPOINTS ==========
 
 @router.post("/connect", response_model=DropiConnectionResponse)
@@ -311,17 +327,27 @@ async def get_wallet(
     
     result = await dropi_login(email, password, connection.country)
     
+    wallet_live = False
+    wallet_error = None
     balance = 0
+    
     if result.get("success"):
         balance = result.get("wallet_balance", 0)
+        wallet_live = True
         connection.current_token = result["token"]
         connection.token_expires_at = datetime.utcnow() + timedelta(hours=24)
         db.commit()
+    else:
+        # Fallback: usar último balance conocido del historial
+        wallet_error = result.get("error", "Error desconocido")
+        balance = get_cached_wallet_balance(db, current_user.id)
     
     return {
         "balance": balance,
         "currency": "COP" if connection.country == "co" else "GTQ",
-        "country": connection.country
+        "country": connection.country,
+        "live": wallet_live,
+        "error": wallet_error
     }
 
 
@@ -471,6 +497,7 @@ async def get_dropi_summary(
 ):
     """
     Resumen completo de Dropi desde CACHE LOCAL - INSTANTÁNEO!
+    Wallet se obtiene en tiempo real con fallback a cache.
     """
     connection = db.query(DropiConnection).filter(
         DropiConnection.user_id == current_user.id,
@@ -634,22 +661,39 @@ async def get_dropi_summary(
         except:
             item["display_date"] = item["date"]
     
-    # Obtener wallet balance actual (esto SÍ requiere login)
+    # ========== WALLET EN TIEMPO REAL CON FALLBACK ==========
     wallet_balance = 0
+    wallet_live = False
+    wallet_error = None
+    
     try:
         email = decrypt_token(connection.email_encrypted)
         password = decrypt_token(connection.password_encrypted)
         login_result = await dropi_login(email, password, connection.country)
+        
         if login_result.get("success"):
             wallet_balance = login_result.get("wallet_balance", 0)
-    except:
-        pass
+            wallet_live = True
+            # Actualizar token en conexión
+            connection.current_token = login_result["token"]
+            connection.token_expires_at = datetime.utcnow() + timedelta(hours=24)
+            db.commit()
+        else:
+            # Login falló - usar cache como fallback
+            wallet_error = login_result.get("error", "Error de conexión")
+            wallet_balance = get_cached_wallet_balance(db, current_user.id)
+    except Exception as e:
+        # Error inesperado - usar cache
+        wallet_error = str(e)[:100]
+        wallet_balance = get_cached_wallet_balance(db, current_user.id)
     
     return {
         "connected": True,
         "wallet": {
             "balance": wallet_balance,
-            "currency": "COP" if connection.country == "co" else "GTQ"
+            "currency": "COP" if connection.country == "co" else "GTQ",
+            "live": wallet_live,
+            "error": wallet_error
         },
         "orders": stats,
         "period": {
