@@ -2,8 +2,8 @@
 Router de Dropi - LEE DE CACHE LOCAL (PostgreSQL)
 Los datos se sincronizan en background, las consultas son INSTANTÁNEAS.
 
-v2.12: Wallet desde cached_wallet_balance (actualizado en sync desde login)
-       NO calcular - usar el valor real de Dropi
+v2.13: Limpia datos al cambiar de cuenta de Dropi
+       Wallet desde cached_wallet_balance (actualizado en sync desde login)
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
@@ -147,6 +147,27 @@ async def dropi_login(email: str, password: str, country: str) -> dict:
         return {"success": False, "error": str(e)[:100]}
 
 
+def clear_user_dropi_data(user_id: int, db: Session):
+    """
+    Limpiar todos los datos de Dropi de un usuario.
+    Se usa cuando cambia de cuenta de Dropi para evitar mezclar datos.
+    """
+    # Borrar órdenes
+    deleted_orders = db.query(DropiOrder).filter(
+        DropiOrder.user_id == user_id
+    ).delete()
+    
+    # Borrar historial de wallet
+    deleted_wallet = db.query(DropiWalletHistory).filter(
+        DropiWalletHistory.user_id == user_id
+    ).delete()
+    
+    db.commit()
+    print(f"[DROPI] Cleared data for user {user_id}: {deleted_orders} orders, {deleted_wallet} wallet movements")
+    
+    return {"orders_deleted": deleted_orders, "wallet_deleted": deleted_wallet}
+
+
 # ========== ENDPOINTS ==========
 
 @router.post("/connect", response_model=DropiConnectionResponse)
@@ -156,7 +177,11 @@ async def connect_dropi(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Conectar cuenta de Dropi y disparar sincronización inicial"""
+    """
+    Conectar cuenta de Dropi y disparar sincronización inicial.
+    
+    v2.13: Si cambia de cuenta (dropi_user_id diferente), limpia datos anteriores.
+    """
     
     if data.country not in DROPI_API_URLS:
         raise HTTPException(
@@ -177,20 +202,36 @@ async def connect_dropi(
     ).first()
     
     wallet_balance = result.get("wallet_balance", 0)
+    new_dropi_user_id = result.get("user_id")
     
     if existing:
+        # ===== DETECTAR CAMBIO DE CUENTA =====
+        old_dropi_user_id = existing.dropi_user_id
+        account_changed = old_dropi_user_id and old_dropi_user_id != new_dropi_user_id
+        
+        if account_changed:
+            print(f"[DROPI] Account changed from {old_dropi_user_id} to {new_dropi_user_id}, clearing old data...")
+            clear_user_dropi_data(current_user.id, db)
+        
+        # Actualizar conexión
         existing.email_encrypted = encrypt_token(data.email)
         existing.password_encrypted = encrypt_token(data.password)
         existing.country = data.country
         existing.current_token = result["token"]
         existing.token_expires_at = datetime.utcnow() + timedelta(hours=24)
-        existing.dropi_user_id = result.get("user_id")
+        existing.dropi_user_id = new_dropi_user_id
         existing.dropi_user_name = result.get("user_name")
         existing.cached_wallet_balance = wallet_balance
         existing.cached_wallet_updated_at = datetime.utcnow()
         existing.is_active = True
         existing.sync_status = "pending"
         existing.updated_at = datetime.utcnow()
+        
+        # Si cambió la cuenta, resetear fechas de sync para forzar full sync
+        if account_changed:
+            existing.last_orders_sync = None
+            existing.last_wallet_sync = None
+        
         db.commit()
         db.refresh(existing)
         connection = existing
@@ -202,7 +243,7 @@ async def connect_dropi(
             country=data.country,
             current_token=result["token"],
             token_expires_at=datetime.utcnow() + timedelta(hours=24),
-            dropi_user_id=result.get("user_id"),
+            dropi_user_id=new_dropi_user_id,
             dropi_user_name=result.get("user_name"),
             cached_wallet_balance=wallet_balance,
             cached_wallet_updated_at=datetime.utcnow(),
@@ -304,6 +345,36 @@ async def disconnect_dropi(
         db.commit()
     
     return {"message": "Dropi desconectado"}
+
+
+@router.delete("/clear-data")
+async def clear_dropi_data(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Limpiar todos los datos de Dropi sin desconectar.
+    Útil para forzar una sincronización completa.
+    """
+    connection = db.query(DropiConnection).filter(
+        DropiConnection.user_id == current_user.id
+    ).first()
+    
+    if not connection:
+        raise HTTPException(status_code=404, detail="No hay conexión de Dropi")
+    
+    # Limpiar datos
+    result = clear_user_dropi_data(current_user.id, db)
+    
+    # Resetear fechas de sync para forzar full sync
+    connection.last_orders_sync = None
+    connection.last_wallet_sync = None
+    db.commit()
+    
+    return {
+        "message": "Datos limpiados. Ejecuta sync para sincronizar de nuevo.",
+        **result
+    }
 
 
 @router.get("/wallet")
