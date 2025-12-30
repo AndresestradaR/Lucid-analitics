@@ -294,6 +294,78 @@ async def debug_sample_contacts(
     }
 
 
+@router.get("/debug/lucidbot-raw/{user_id}")
+async def debug_lucidbot_raw(
+    user_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """
+    DEBUG: Ver datos RAW de LucidBot para un usuario.
+    Esto muestra exactamente qué devuelve la API de LucidBot, incluyendo todos los campos.
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    
+    connection = db.query(LucidbotConnection).filter(
+        LucidbotConnection.user_id == user_id,
+        LucidbotConnection.is_active == True
+    ).first()
+    
+    if not connection or not connection.jwt_token_encrypted:
+        return {"error": "No hay conexión de LucidBot activa", "user_id": user_id}
+    
+    jwt_token = decrypt_token(connection.jwt_token_encrypted)
+    page_id = connection.page_id
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Cookie": f"token={jwt_token}; last_page_id={page_id}"
+    }
+    
+    payload = {
+        "op": "users",
+        "op1": "get",
+        "cdts": [],
+        "oprt": 1,
+        "search_text": "",
+        "datatable": {
+            "draw": 1,
+            "start": 0,
+            "length": 5,
+            "orderByName": [{"column": {"name": "dt"}, "dir": "desc"}]
+        },
+        "pageName": "users",
+        "page_id": page_id
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                LUCIDBOT_PHP_URL,
+                headers=headers,
+                json=payload
+            )
+            
+            if response.status_code != 200:
+                return {"error": f"HTTP {response.status_code}", "user_id": user_id}
+            
+            data = response.json()
+            
+            return {
+                "user_id": user_id,
+                "email": user.email,
+                "page_id": page_id,
+                "lucidbot_status": data.get("status"),
+                "total_records": data.get("recordsTotal"),
+                "raw_contacts": data.get("data", [])[:5],
+                "all_fields_first_contact": data.get("data", [{}])[0] if data.get("data") else {}
+            }
+    except Exception as e:
+        return {"error": str(e), "user_id": user_id}
+
+
 # ========== DROPI DEBUG ENDPOINTS ==========
 
 @router.get("/debug/dropi-connection/{user_id}")
