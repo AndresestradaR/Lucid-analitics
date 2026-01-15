@@ -160,6 +160,147 @@ async def meta_oauth_callback(
         }
 
 
+@router.post("/sync-accounts")
+async def sync_meta_accounts(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Sincronizar cuentas de Meta Ads usando el token existente.
+    Útil cuando el usuario tiene acceso a nuevos BMs o cuentas publicitarias
+    sin necesidad de re-hacer OAuth completo.
+    """
+    
+    # Buscar una cuenta activa con token válido
+    existing_account = db.query(MetaAccount).filter(
+        MetaAccount.user_id == current_user.id,
+        MetaAccount.is_active == True,
+        MetaAccount.access_token_encrypted.isnot(None)
+    ).first()
+    
+    if not existing_account:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No hay cuentas de Meta conectadas. Primero conecta Meta Ads."
+        )
+    
+    # Desencriptar token
+    try:
+        access_token = decrypt_token(existing_account.access_token_encrypted)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Token de Meta inválido. Por favor reconecta Meta Ads."
+        )
+    
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        # Verificar que el token sigue siendo válido
+        debug_response = await client.get(
+            f"{META_BASE_URL}/debug_token",
+            params={
+                "input_token": access_token,
+                "access_token": access_token
+            }
+        )
+        
+        if debug_response.status_code != 200:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Token de Meta expirado. Por favor reconecta Meta Ads."
+            )
+        
+        debug_data = debug_response.json().get("data", {})
+        if not debug_data.get("is_valid", False):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Token de Meta inválido o expirado. Por favor reconecta Meta Ads."
+            )
+        
+        # Obtener todas las cuentas publicitarias actuales
+        accounts_response = await client.get(
+            f"{META_BASE_URL}/me/adaccounts",
+            params={
+                "access_token": access_token,
+                "fields": "id,name,account_status,currency,business{id,name}",
+                "limit": 500
+            }
+        )
+        
+        if accounts_response.status_code != 200:
+            error_data = accounts_response.json()
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=error_data.get("error", {}).get("message", "Error obteniendo cuentas de Meta")
+            )
+        
+        accounts_data = accounts_response.json().get("data", [])
+        
+        # Obtener IDs de cuentas existentes
+        existing_account_ids = set(
+            acc.account_id for acc in db.query(MetaAccount).filter(
+                MetaAccount.user_id == current_user.id
+            ).all()
+        )
+        
+        new_accounts = []
+        updated_accounts = []
+        
+        for account in accounts_data:
+            account_id = account.get("id", "").replace("act_", "")
+            account_name = account.get("name", "")
+            
+            # Agregar info del Business Manager al nombre si está disponible
+            business = account.get("business", {})
+            business_name = business.get("name", "")
+            
+            # Si tiene BM, agregar prefijo para identificarlo
+            if business_name:
+                display_name = f"[{business_name}] {account_name}"
+            else:
+                display_name = account_name
+            
+            existing = db.query(MetaAccount).filter(
+                MetaAccount.user_id == current_user.id,
+                MetaAccount.account_id == account_id
+            ).first()
+            
+            if existing:
+                # Actualizar cuenta existente
+                existing.access_token_encrypted = encrypt_token(access_token)
+                existing.account_name = display_name
+                existing.is_active = True
+                existing.updated_at = datetime.utcnow()
+                updated_accounts.append({
+                    "id": account_id,
+                    "name": display_name,
+                    "business": business_name
+                })
+            else:
+                # Crear nueva cuenta
+                new_account = MetaAccount(
+                    user_id=current_user.id,
+                    account_id=account_id,
+                    account_name=display_name,
+                    access_token_encrypted=encrypt_token(access_token),
+                    is_active=True
+                )
+                db.add(new_account)
+                new_accounts.append({
+                    "id": account_id,
+                    "name": display_name,
+                    "business": business_name
+                })
+        
+        db.commit()
+        
+        return {
+            "message": f"Sincronización completada. {len(new_accounts)} nuevas, {len(updated_accounts)} actualizadas.",
+            "new_accounts": new_accounts,
+            "updated_accounts": updated_accounts,
+            "total_accounts": len(accounts_data)
+        }
+
+
 @router.delete("/disconnect/{account_id}")
 async def disconnect_meta_account(
     account_id: str,
